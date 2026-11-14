@@ -170,6 +170,9 @@ type Traffic struct {
 	// transparent-passthrough paths honor it (go-mitmproxy's getUpstreamConn),
 	// so no host escapes it. Hot-swappable at runtime via SetUpstreamProxy.
 	upstream atomic.Pointer[url.URL]
+	// egress 是出口选路器（代理池+粘性），非 nil 时优先于 upstream 生效；
+	// 选不出出口时仍降级到 upstream → 直连。由 server 通过 ReplaceEgressPool 喂池。
+	egress atomic.Pointer[egressSelector]
 }
 
 // Open initializes the traffic tree, blob store and SQLite index under dir.
@@ -218,7 +221,7 @@ func Open(dir, addr string) (*Traffic, error) {
 	// a direct dial. When a global egress proxy IS configured (SetUpstreamProxy),
 	// every captured request — intercepted AND transparently tunneled — is
 	// forwarded through it instead, so no host leaks the real source IP.
-	p.SetUpstreamProxy(func(*http.Request) (*url.URL, error) { return t.upstream.Load(), nil })
+	p.SetUpstreamProxy(func(req *http.Request) (*url.URL, error) { return t.selectUpstream(req), nil })
 	// Fail-open: MITM every host by default, EXCEPT ones a prior request proved we
 	// can't intercept without breaking (see maybePassthrough). Those are tunneled
 	// transparently so the request still reaches the target instead of being killed.
@@ -314,6 +317,9 @@ func (t *Traffic) ProxyAddr() string {
 // it, restoring direct dialing. The change is atomic and takes effect on the next
 // connection — no restart, no proxy rebuild. go-mitmproxy dials all three schemes
 // itself, so socks5 works uniformly here regardless of the target tool.
+//
+// 这是三层降级中的中间层：代理池选路器（ReplaceEgressPool 装载）优先，
+// 池选不出出口时落到这里，直连是最后兑底。
 func (t *Traffic) SetUpstreamProxy(raw string) error {
 	if strings.TrimSpace(raw) == "" {
 		t.upstream.Store(nil)
@@ -347,6 +353,77 @@ func ValidateProxyURL(raw string) (*url.URL, error) {
 		return nil, fmt.Errorf("代理 %q 缺少主机地址", raw)
 	}
 	return u, nil
+}
+
+// selectUpstream resolves the egress for one request: pool selector first,
+// then the global egress proxy, then nil (direct dial).
+func (t *Traffic) selectUpstream(req *http.Request) *url.URL {
+	if s := t.egress.Load(); s != nil {
+		if u := s.Pick(req.URL.Host); u != nil {
+			return u
+		}
+	}
+	return t.upstream.Load()
+}
+
+// ReplaceEgressPool installs (or with nil entries removes) the egress pool
+// selector. Called by the server layer on startup, pool CRUD and subscription
+// sync; pool entries carry their persisted ok/banned/down state. An existing
+// selector is updated in place — its sticky table and ban cooldowns survive
+// pool reloads, which happen after every state write-back.
+func (t *Traffic) ReplaceEgressPool(entries []EgressProxy, onState func(proxyID int64, state, lastErr string)) {
+	if len(entries) == 0 {
+		t.egress.Store(nil)
+		return
+	}
+	s := t.egress.Load()
+	if s == nil {
+		s = newEgressSelector()
+		s.OnEgressState = onState
+		t.egress.Store(s)
+	} else if onState != nil {
+		s.OnEgressState = onState
+	}
+	s.ReplaceEgressPool(entries)
+}
+
+// noteEgressBan feeds one recorded response into the ban detector. record() has
+// the decompressed response body, which is what the keyword rules need.
+func (t *Traffic) noteEgressBan(hostKey string, status int, body []byte) {
+	t.egress.Load().NoteBanned(hostKey, body, status)
+}
+
+// noteEgressDialFailure attributes a connect/request failure to the egress
+// proxy when the error clearly points at the proxy itself (its host:port or an
+// explicit proxy-protocol failure) — a target that is simply down must not get
+// the proxy marked down. Returns the proxyID attributed, 0 when not attributed.
+func (t *Traffic) noteEgressDialFailure(hostKey string, err error) int64 {
+	s := t.egress.Load()
+	if s == nil || err == nil {
+		return 0
+	}
+	proxyID, ok := s.StickyProxy(hostKey)
+	if !ok {
+		return 0
+	}
+	// 找到该代理的拨号地址，错误串里出现它才归因给代理。
+	var proxyHost string
+	s.mu.RLock()
+	for i := range s.pool {
+		if s.pool[i].ID == proxyID {
+			proxyHost = fmt.Sprintf("%s:%d", s.pool[i].Host, s.pool[i].Port)
+			break
+		}
+	}
+	s.mu.RUnlock()
+	msg := strings.ToLower(err.Error())
+	if proxyHost == "" || !strings.Contains(msg, strings.ToLower(proxyHost)) {
+		if !strings.Contains(msg, "proxy") && !strings.Contains(msg, "socks") {
+			return 0
+		}
+	}
+	s.NoteDialFailure(proxyID, err.Error())
+	return proxyID
 }
 
 // CACertPath returns the PEM CA cert clients must trust to verify HTTPS through
@@ -400,7 +477,25 @@ func (s *sink) Response(f *mproxy.Flow) {
 // the failure looks proxy/protocol-caused (h2 quirks, HEAD-with-body, protocol
 // errors) — not a plain target-unreachable error — we flag the host for
 // transparent passthrough so future requests to it succeed instead of dying.
-func (s *sink) RequestError(f *mproxy.Flow, err error) { s.t.maybePassthrough(f, err) }
+func (s *sink) RequestError(f *mproxy.Flow, err error) {
+	s.t.noteEgressDialFailureForFlow(f, err)
+	s.t.maybePassthrough(f, err)
+}
+
+// HTTPConnectError fires when the CONNECT tunnel (or the plain-HTTP path) fails
+// to reach the upstream — including the egress proxy itself being unreachable.
+func (s *sink) HTTPConnectError(f *mproxy.Flow, err error) {
+	s.t.noteEgressDialFailureForFlow(f, err)
+}
+
+// noteEgressDialFailureForFlow routes a flow-level failure into egress
+// attribution; host extraction lives here so the selector stays flow-agnostic.
+func (t *Traffic) noteEgressDialFailureForFlow(f *mproxy.Flow, err error) {
+	if f == nil || f.Request == nil || f.Request.URL == nil {
+		return
+	}
+	t.noteEgressDialFailure(f.Request.URL.Host, err)
+}
 
 // maybePassthrough marks a host to be tunneled transparently on the next
 // connection, but only for errors the proxy itself caused — a target that is
@@ -447,6 +542,12 @@ func (t *Traffic) record(f *mproxy.Flow) {
 
 	ct := f.Response.Header.Get("Content-Type")
 	url := f.Request.URL.String()
+	// 封禁信号检测在锁外做不合适——NoteBanned 自己带锁，但为了不让选路器锁
+	// 与 wmu 形成依赖，放在事务之后调用也一样（只是顺序上晚一步）。
+	// 这里先把需要的字段读出来，避免持锁时再碰 f。
+	hostKey := f.Request.URL.Host
+	banStatus := f.Response.StatusCode
+	banBody := f.Response.Body
 	reqHead := fmt.Sprintf("%s %s %s\n%s", method, f.Request.URL.RequestURI(), f.Request.Proto, requestHeaderLines(f.Request))
 	respHead := fmt.Sprintf("HTTP %d\n%s", f.Response.StatusCode, headerLines(f.Response.Header))
 	// Bodies are spilled before the transaction opens: blob writes are filesystem
@@ -507,6 +608,7 @@ VALUES(?,?,?,?,?,?,?)`,
 	if err := tx.Commit(); err != nil {
 		log.Printf("[traffic] 记录 %s 失败（提交）：%v", url, err)
 	}
+	t.noteEgressBan(hostKey, banStatus, banBody)
 }
 
 // storedBody is one body after the inline/spill decision: inline is what goes in

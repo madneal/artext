@@ -240,6 +240,9 @@ type Manager struct {
 	braveKey         string
 	tavilyKey        string
 	webSearchProxy   string
+	// egressEngine 把 vless 池条目翻译成本地 socks 出口（sing-box 内嵌实例）。
+	// 无 vless 条目时不启动。见 egress_engine.go。
+	egressEngine *egressEngine
 	// globalProxy is the egress proxy all target traffic routes through
 	// (http/https/socks5, optional user:pass). Empty = direct. When traffic
 	// capture is on it becomes the MITM's upstream; when capture is off it is
@@ -373,7 +376,7 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	if err := pg.EnsureLLMUsageTable(); err != nil {
 		log.Printf("[llmusage] create table: %v", err)
 	}
-	m := &Manager{dir: dir, pg: pg, assets: pg.Assets(), tasks: map[string]*Task{}, interceptor: intercept.New(pg)}
+	m := &Manager{dir: dir, pg: pg, assets: pg.Assets(), tasks: map[string]*Task{}, interceptor: intercept.New(pg), egressEngine: newEgressEngine()}
 	if proxyAddr != "" {
 		tr, err := traffic.Open(filepath.Join(dir, "traffic"), proxyAddr)
 		if err != nil {
@@ -439,6 +442,9 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 			log.Printf("[proxy] 全局代理 %q 无效，已忽略: %v", m.globalProxy, err)
 		}
 	}
+	// 出口代理池：启动时装载一次，后续由订阅 poller 与 CRUD 变更时刷新。
+	m.refreshEgressPool()
+	m.startSubscriptionPoller()
 	m.enrich = enrich.New(m.assets, m.ProxyAddr, 4)
 	// Reconcile the seeded browser MCP with the persisted capture state, so a
 	// restart with capture already on keeps Playwright routed through the proxy.
@@ -805,6 +811,9 @@ func (m *Manager) Close() error {
 	defer m.mu.Unlock()
 	if m.traffic != nil {
 		m.traffic.Close()
+	}
+	if m.egressEngine != nil {
+		m.egressEngine.Close()
 	}
 	return m.pg.Close()
 }
