@@ -546,11 +546,12 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   const [uploading, setUploading] = React.useState(false);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
 
-  async function pickFiles(files: FileList | null) {
-    if (!files || files.length === 0) return;
+  async function pickFiles(files: FileList | File[] | null) {
+    const list = files ? Array.from(files) : [];
+    if (list.length === 0) return;
     setUploading(true);
     try {
-      const r = await api.chatUpload("task", taskId, Array.from(files));
+      const r = await api.chatUpload("task", taskId, list);
       setAttachments((prev) => [...prev, ...r.attachments]);
     } catch (e) {
       toast.error(`上传失败：${(e as Error).message}`);
@@ -1951,6 +1952,13 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                     value={input}
                     disabled={sending}
                     onValueChange={setInput}
+                    onPaste={(e) => {
+                      // 直接粘贴图片/文件：剪贴板里有文件时接管 paste，走与回形针相同的上传链路。
+                      const files = Array.from(e.clipboardData?.files ?? []);
+                      if (files.length === 0) return;
+                      e.preventDefault();
+                      void pickFiles(files);
+                    }}
                     onKeyDown={(e) => {
                       if (!shouldSubmitOnKey(e, sendMode)) return;
                       e.preventDefault();

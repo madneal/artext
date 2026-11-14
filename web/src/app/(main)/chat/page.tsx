@@ -248,6 +248,15 @@ function Composer({
           disabled={disabled && !(running && allowBtw)}
           onValueChange={onChange}
           onKeyDown={onKeyDown}
+          onPaste={(e) => {
+            // 直接粘贴图片/文件：剪贴板里有文件时接管 paste，走与回形针相同的上传链路；
+            // 纯文本粘贴不拦截。
+            if (!onPickFiles) return;
+            const files = Array.from(e.clipboardData?.files ?? []);
+            if (files.length === 0) return;
+            e.preventDefault();
+            onPickFiles(files);
+          }}
         />
         {running && allowBtw && isBtwCommand(value) && (
           <Button size="icon" onClick={onSend} aria-label="发送旁路问题" title="发送旁路问题">
