@@ -1429,3 +1429,6 @@ CREATE TABLE IF NOT EXISTS proxy_pool (
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_proxy_pool_enabled ON proxy_pool(enabled, state);
+
+-- 阶段 1.5：存量库补列（CREATE TABLE IF NOT EXISTS 不会给已存在的表加列）。
+ALTER TABLE proxy_pool ADD COLUMN IF NOT EXISTS transport JSONB;
