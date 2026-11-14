@@ -185,7 +185,7 @@ func buildBoxOptions(entries []db.ProxyEntry) (option.Options, map[int64]string,
 	}
 
 	return option.Options{
-		Log: &option.LogOptions{Disabled: true},
+		Log: &option.LogOptions{Level: "error"},
 		DNS: &option.DNSOptions{
 			RawDNSOptions: option.RawDNSOptions{
 				Servers: []option.DNSServerOptions{{Type: "local", Tag: "egress-dns"}},

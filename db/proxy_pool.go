@@ -176,12 +176,13 @@ WHERE id = $1`, id, p.Name, p.Scheme, p.Host, p.Port, p.Username, p.Password, p.
 }
 
 // nullJSON 把空/空对象 JSON 归一为 SQL NULL，避免覆盖成 '{}' 垃圾。
-func nullJSON(raw json.RawMessage) any {
+// 返回 sql.NullString 而非裸 nil——pgx v5 预编译语句无法推断无类型参数。
+func nullJSON(raw json.RawMessage) sql.NullString {
 	t := bytes.TrimSpace(raw)
 	if len(t) == 0 || string(t) == "null" || string(t) == "{}" {
-		return nil
+		return sql.NullString{}
 	}
-	return raw
+	return sql.NullString{String: string(t), Valid: true}
 }
 
 // GetProxyEntry 按 id 取一条。
