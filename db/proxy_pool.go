@@ -1,7 +1,9 @@
 package db
 
 import (
+	"bytes"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"strings"
 	"time"
@@ -10,8 +12,9 @@ import (
 // 出口代理池（阶段 1）的持久层。选路/粘性/封禁逻辑在 traffic/selector.go，
 // 这里只做配置 CRUD 与运行时状态回写。schema 见 db/schema.sql 出口代理池一节。
 
-// 代理出口协议白名单。与 traffic.ValidateProxyURL 的支持面保持一致。
-var ProxySchemes = map[string]bool{"http": true, "https": true, "socks5": true}
+// 代理出口协议白名单。http/https/socks5 由 go-mitmproxy 直接拨号；vless 经
+// sing-box 引擎翻译成本地 socks 出口后再进选路器。
+var ProxySchemes = map[string]bool{"http": true, "https": true, "socks5": true, "vless": true}
 
 // 代理条目来源。
 const (
@@ -32,21 +35,24 @@ var ErrProxySourceNotFound = errors.New("订阅源不存在")
 // ProxyEntry 是池里的一条出口代理。Password 不脱敏返回——代理凭据与既有
 // LLM profile 的 api_key 同级，本就属于管理员可配置项。
 type ProxyEntry struct {
-	ID         int64      `json:"id"`
-	Name       string     `json:"name"`
-	Scheme     string     `json:"scheme"`
-	Host       string     `json:"host"`
-	Port       int        `json:"port"`
-	Username   string     `json:"username"`
-	Password   string     `json:"password"`
-	Enabled    *bool      `json:"enabled,omitempty"`
-	Source     string     `json:"source"`
-	SourceID   int64      `json:"source_id"`
-	State      string     `json:"state"`
-	LastError  string     `json:"last_error"`
-	LastUsedAt *time.Time `json:"last_used_at"`
-	CreatedAt  time.Time  `json:"created_at"`
-	UpdatedAt  time.Time  `json:"updated_at"`
+	ID       int64  `json:"id"`
+	Name     string `json:"name"`
+	Scheme   string `json:"scheme"`
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+	Enabled  *bool  `json:"enabled,omitempty"`
+	// Transport 承载 vless 等协议的传输层参数（uuid/flow/security/sni/ws/grpc/reality），
+	// http/socks5 条目为 nil。db 层不理解字段含义，白名单在 traffic 解析与引擎侧。
+	Transport  json.RawMessage `json:"transport,omitempty"`
+	Source     string          `json:"source"`
+	SourceID   int64           `json:"source_id"`
+	State      string          `json:"state"`
+	LastError  string          `json:"last_error"`
+	LastUsedAt *time.Time      `json:"last_used_at"`
+	CreatedAt  time.Time       `json:"created_at"`
+	UpdatedAt  time.Time       `json:"updated_at"`
 }
 
 // IsEnabled 返回代理是否启用；Enabled 为 nil（未加载）时按启用处理。
@@ -67,12 +73,12 @@ type ProxySource struct {
 
 func validScheme(s string) bool { return ProxySchemes[strings.ToLower(s)] }
 
-const proxyEntryCols = `id, name, scheme, host, port, username, password, enabled, source, coalesce(source_id,0), state, last_error, last_used_at, created_at, updated_at`
+const proxyEntryCols = `id, name, scheme, host, port, username, password, enabled, transport, source, coalesce(source_id,0), state, last_error, last_used_at, created_at, updated_at`
 
 func scanProxyEntry(s interface{ Scan(...any) error }) (ProxyEntry, error) {
 	var p ProxyEntry
 	err := s.Scan(&p.ID, &p.Name, &p.Scheme, &p.Host, &p.Port, &p.Username, &p.Password,
-		&p.Enabled, &p.Source, &p.SourceID, &p.State, &p.LastError, &p.LastUsedAt,
+		&p.Enabled, &p.Transport, &p.Source, &p.SourceID, &p.State, &p.LastError, &p.LastUsedAt,
 		&p.CreatedAt, &p.UpdatedAt)
 	return p, err
 }
@@ -96,16 +102,22 @@ func (d *DB) CreateProxyEntry(p ProxyEntry) (ProxyEntry, error) {
 		p.State = ProxyStateOK
 	}
 	var created ProxyEntry
+	if p.Scheme == "vless" && len(p.Transport) == 0 {
+		return ProxyEntry{}, errors.New("vless 条目缺少 transport 配置(uuid/传输层)")
+	}
+	if p.Scheme != "vless" && len(p.Transport) > 0 {
+		return ProxyEntry{}, errors.New("仅 vless 条目支持 transport 配置")
+	}
 	err := d.QueryRow(`
-INSERT INTO proxy_pool(name, scheme, host, port, username, password, enabled, source, source_id, state)
-VALUES ($1,$2,$3,$4,$5,$6,coalesce($7,true),$8,nullif($9,0),$10)
+INSERT INTO proxy_pool(name, scheme, host, port, username, password, enabled, transport, source, source_id, state)
+VALUES ($1,$2,$3,$4,$5,$6,coalesce($7,true),$8,$9,nullif($10,0),$11)
 RETURNING `+proxyEntryCols,
-		p.Name, p.Scheme, p.Host, p.Port, p.Username, p.Password, p.Enabled,
+		p.Name, p.Scheme, p.Host, p.Port, p.Username, p.Password, p.Enabled, nullJSON(p.Transport),
 		p.Source, p.SourceID, p.State).Scan(
 		&created.ID, &created.Name, &created.Scheme, &created.Host, &created.Port,
-		&created.Username, &created.Password, &created.Enabled, &created.Source,
-		&created.SourceID, &created.State, &created.LastError, &created.LastUsedAt,
-		&created.CreatedAt, &created.UpdatedAt)
+		&created.Username, &created.Password, &created.Enabled, &created.Transport,
+		&created.Source, &created.SourceID, &created.State, &created.LastError,
+		&created.LastUsedAt, &created.CreatedAt, &created.UpdatedAt)
 	return created, err
 }
 
@@ -129,13 +141,14 @@ func (d *DB) ListProxyEntries() ([]ProxyEntry, error) {
 
 // ProxyEntryPatch 是 UpdateProxyEntry 的局部更新载荷：仅非 nil 字段被覆盖。
 type ProxyEntryPatch struct {
-	Name     *string
-	Scheme   *string
-	Host     *string
-	Port     *int
-	Username *string
-	Password *string
-	Enabled  *bool
+	Name      *string
+	Scheme    *string
+	Host      *string
+	Port      *int
+	Username  *string
+	Password  *string
+	Enabled   *bool
+	Transport json.RawMessage
 }
 
 // UpdateProxyEntry 局部更新：仅覆盖调用方显式传入的指针字段；state/last_error
@@ -149,9 +162,10 @@ UPDATE proxy_pool SET
 	port        = coalesce($5, port),
 	username    = coalesce($6, username),
 	password    = coalesce($7, password),
-	enabled     = coalesce($8, enabled),
+	transport   = coalesce($9, transport),
+	enabled     = coalesce($10, enabled),
 	updated_at  = now()
-WHERE id = $1`, id, p.Name, p.Scheme, p.Host, p.Port, p.Username, p.Password, p.Enabled)
+WHERE id = $1`, id, p.Name, p.Scheme, p.Host, p.Port, p.Username, p.Password, p.Enabled, nullJSON(p.Transport))
 	if err != nil {
 		return ProxyEntry{}, err
 	}
@@ -159,6 +173,15 @@ WHERE id = $1`, id, p.Name, p.Scheme, p.Host, p.Port, p.Username, p.Password, p.
 		return ProxyEntry{}, ErrProxyNotFound
 	}
 	return d.GetProxyEntry(id)
+}
+
+// nullJSON 把空/空对象 JSON 归一为 SQL NULL，避免覆盖成 '{}' 垃圾。
+func nullJSON(raw json.RawMessage) any {
+	t := bytes.TrimSpace(raw)
+	if len(t) == 0 || string(t) == "null" || string(t) == "{}" {
+		return nil
+	}
+	return raw
 }
 
 // GetProxyEntry 按 id 取一条。

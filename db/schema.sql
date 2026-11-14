@@ -1413,6 +1413,9 @@ CREATE TABLE IF NOT EXISTS proxy_pool (
     username    TEXT NOT NULL DEFAULT '',
     password    TEXT NOT NULL DEFAULT '',
     enabled     BOOLEAN NOT NULL DEFAULT true,
+    -- vless 等协议的传输层参数（uuid/flow/security/sni/ws/grpc/reality），
+    -- http/socks5 条目为 NULL。结构由 server/traffic 侧白名单定义，db 不理解字段含义。
+    transport   JSONB,
     -- manual 手动录入 / subscription 订阅同步产物。取值不加 CHECK，与
     -- findings.status 同理，由 server 侧白名单校验。
     source      TEXT NOT NULL DEFAULT 'manual',
