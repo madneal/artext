@@ -1384,3 +1384,45 @@ CREATE INDEX IF NOT EXISTS idx_notification_deliveries_batch
     ON notification_deliveries(batch_id) WHERE batch_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_notification_deliveries_channel
     ON notification_deliveries(channel_id, id DESC);
+
+-- ============================================================================
+-- 出口代理池（阶段 1）：换 IP / 防封禁。选路逻辑在 traffic/selector.go，
+-- 这里只存配置与状态事实；池为空时出口回退到旧的全局代理设置（settings 表）。
+--
+-- 订阅同步按 source_id 归组 diff：拉取结果里有则 upsert、消失则置 disabled，
+-- manual 条目永远不被订阅触碰。proxy_sources 先建，proxy_pool 才能引用。
+
+CREATE TABLE IF NOT EXISTS proxy_sources (
+    id           BIGSERIAL PRIMARY KEY,
+    name         TEXT NOT NULL,
+    url          TEXT NOT NULL,
+    enabled      BOOLEAN NOT NULL DEFAULT true,
+    last_sync_at TIMESTAMPTZ,
+    last_count   INTEGER NOT NULL DEFAULT 0,
+    last_error   TEXT NOT NULL DEFAULT '',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS proxy_pool (
+    id          BIGSERIAL PRIMARY KEY,
+    name        TEXT NOT NULL DEFAULT '',
+    scheme      TEXT NOT NULL, -- http / https / socks5，白名单校验在 db/server 侧
+    host        TEXT NOT NULL,
+    port        INTEGER NOT NULL,
+    username    TEXT NOT NULL DEFAULT '',
+    password    TEXT NOT NULL DEFAULT '',
+    enabled     BOOLEAN NOT NULL DEFAULT true,
+    -- manual 手动录入 / subscription 订阅同步产物。取值不加 CHECK，与
+    -- findings.status 同理，由 server 侧白名单校验。
+    source      TEXT NOT NULL DEFAULT 'manual',
+    source_id   BIGINT REFERENCES proxy_sources(id) ON DELETE CASCADE,
+    -- ok 可用 / banned 被目标封禁（命中封禁信号）/ down 连接失败。运行时状态，
+    -- 重启不重置：下次启动仍避开已知坏出口。
+    state       TEXT NOT NULL DEFAULT 'ok',
+    last_error  TEXT NOT NULL DEFAULT '',
+    last_used_at TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_proxy_pool_enabled ON proxy_pool(enabled, state);
