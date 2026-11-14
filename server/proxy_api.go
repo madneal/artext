@@ -150,17 +150,31 @@ func (m *Manager) SyncProxySource(ctx context.Context, sourceID int64) (int, err
 	if err != nil {
 		return 0, err
 	}
+	// 单节点 URI 误贴进订阅框是高频操作：vless:// 开头时直接按节点解析入池，
+	// 不发起 HTTP 拉取（否则报 unsupported protocol scheme，用户看不懂）。
+	if strings.HasPrefix(strings.TrimSpace(src.URL), "vless://") {
+		node, err := traffic.ParseVLESSURI(src.URL)
+		if err != nil {
+			_ = m.pg.MarkProxySourceSynced(sourceID, 0, err.Error())
+			return 0, err
+		}
+		return m.syncParsedEntries(sourceID, src, []traffic.EgressProxy{node})
+	}
 	parsed, err := fetchSubscription(ctx, src.URL)
 	if err != nil {
 		_ = m.pg.MarkProxySourceSynced(sourceID, src.LastCount, err.Error())
 		return 0, err
 	}
+	return m.syncParsedEntries(sourceID, src, parsed)
+}
 
+// syncParsedEntries 把解析好的条目 diff 进池：新 URI 插入、消失的旧同步产物
+// 停用、manual 条目与其他来源不受影响。
+func (m *Manager) syncParsedEntries(sourceID int64, src db.ProxySource, parsed []traffic.EgressProxy) (int, error) {
 	existing, err := m.pg.ListProxyEntries()
 	if err != nil {
 		return 0, err
 	}
-	// seen 记录本次订阅仍提供的条目键，用于停用消失条目。
 	seen := map[string]bool{}
 	seq := 0
 	for _, p := range parsed {

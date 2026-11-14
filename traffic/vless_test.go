@@ -115,3 +115,34 @@ func TestParseProxyLineVLESS(t *testing.T) {
 		t.Fatalf("第二条应为 vless: %+v", got[1])
 	}
 }
+
+func TestParseVLESSURIVariants(t *testing.T) {
+	// 真实机场节点常见变体回归。
+	ok := []string{
+		"vless://u@1.2.3.4:443?encryption=none&security=tls&sni=cdn.example.com&fp=chrome&type=ws&host=cdn.example.com&path=%2Fws",
+		"vless://u@1.2.3.4:2053?security=tls&type=http&host=cdn.example.com&path=%2F",
+		"vless://u@1.2.3.4:443?security=tls&type=httpupgrade&host=cdn.example.com&path=%2F",
+		"vless://{u}@1.2.3.4:443?security=tls", // 大括号 UUID
+		"vless://u@1.2.3.4:443?type=tcp&headerType=none",
+		"vless://u@1.2.3.4:443#MIN",
+	}
+	for _, raw := range ok {
+		if _, err := ParseVLESSURI(raw); err != nil {
+			t.Fatalf("%q 应解析成功: %v", raw, err)
+		}
+	}
+	// 大括号被剥掉
+	p, err := ParseVLESSURI("vless://{my-uuid}@1.2.3.4:443?security=tls")
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	var vt VLESSTransport
+	_ = json.Unmarshal(p.Transport, &vt)
+	if vt.UUID != "my-uuid" {
+		t.Fatalf("大括号未剥离: %q", vt.UUID)
+	}
+	// xhttp 明确报错而非含糊拒绝
+	if _, err := ParseVLESSURI("vless://u@1.2.3.4:443?type=xhttp"); err == nil {
+		t.Fatal("xhttp 应报错")
+	}
+}

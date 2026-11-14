@@ -36,6 +36,17 @@ type VLESSTransport struct {
 // 返回的 EgressProxy 没有 ID（调用方入库后获得），Enabled/State 由调用方定。
 func ParseVLESSURI(raw string) (EgressProxy, error) {
 	raw = strings.TrimSpace(raw)
+	// 部分客户端导出的 UUID 带 {}（如 vless://{uuid}@host），url.Parse 视为
+	// 非法 userinfo——只在 userinfo 段（首个 @ 之前）剥掉大括号。
+	if at := strings.Index(raw, "@"); at > 0 {
+		head := strings.Map(func(r rune) rune {
+			if r == '{' || r == '}' {
+				return -1
+			}
+			return r
+		}, raw[:at])
+		raw = head + raw[at:]
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return EgressProxy{}, fmt.Errorf("解析 vless URI %q: %w", raw, err)
@@ -53,8 +64,10 @@ func ParseVLESSURI(raw string) (EgressProxy, error) {
 	}
 	q := u.Query()
 
+	uuid := strings.TrimSpace(u.User.Username())
+	uuid = strings.Trim(uuid, "{}")
 	vt := VLESSTransport{
-		UUID:        u.User.Username(),
+		UUID:        uuid,
 		Flow:        q.Get("flow"),
 		Security:    strings.ToLower(q.Get("security")),
 		SNI:         q.Get("sni"),
@@ -82,10 +95,14 @@ func ParseVLESSURI(raw string) (EgressProxy, error) {
 	default:
 		return EgressProxy{}, fmt.Errorf("不支持的 vless security %q（none/tls/reality）", vt.Security)
 	}
+	// xhttp 是 Xray 独有传输层，sing-box 没有——明确报错而不是含糊拒绝。
+	if vt.Transport == "xhttp" || vt.Transport == "splithttp" {
+		return EgressProxy{}, fmt.Errorf("xhttp/splithttp 传输层暂不支持（sing-box 无此传输）")
+	}
 	switch vt.Transport {
-	case "tcp", "ws", "grpc":
+	case "tcp", "ws", "grpc", "http", "httpupgrade":
 	default:
-		return EgressProxy{}, fmt.Errorf("不支持的 vless 传输层 %q（tcp/ws/grpc）", vt.Transport)
+		return EgressProxy{}, fmt.Errorf("不支持的 vless 传输层 %q（tcp/ws/grpc/http/httpupgrade）", vt.Transport)
 	}
 	if vt.Transport == "grpc" && vt.GRPCService == "" {
 		return EgressProxy{}, fmt.Errorf("grpc 传输层缺少 serviceName")
