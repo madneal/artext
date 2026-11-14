@@ -49,6 +49,9 @@ type ProxyEntry struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// IsEnabled 返回代理是否启用；Enabled 为 nil（未加载）时按启用处理。
+func (p *ProxyEntry) IsEnabled() bool { return p.Enabled == nil || *p.Enabled }
+
 // ProxySource 是一个订阅源。
 type ProxySource struct {
 	ID         int64      `json:"id"`
@@ -124,9 +127,20 @@ func (d *DB) ListProxyEntries() ([]ProxyEntry, error) {
 	return out, rows.Err()
 }
 
+// ProxyEntryPatch 是 UpdateProxyEntry 的局部更新载荷：仅非 nil 字段被覆盖。
+type ProxyEntryPatch struct {
+	Name     *string
+	Scheme   *string
+	Host     *string
+	Port     *int
+	Username *string
+	Password *string
+	Enabled  *bool
+}
+
 // UpdateProxyEntry 局部更新：仅覆盖调用方显式传入的指针字段；state/last_error
 // 由选路器经 MarkProxyState 写，不走这里。
-func (d *DB) UpdateProxyEntry(id int64, p ProxyEntry) (ProxyEntry, error) {
+func (d *DB) UpdateProxyEntry(id int64, p ProxyEntryPatch) (ProxyEntry, error) {
 	res, err := d.Exec(`
 UPDATE proxy_pool SET
 	name        = coalesce($2, name),
@@ -137,7 +151,7 @@ UPDATE proxy_pool SET
 	password    = coalesce($7, password),
 	enabled     = coalesce($8, enabled),
 	updated_at  = now()
-WHERE id = $1`, id, p.Name, p.Scheme, p.Host, nullableInt(p.Port), p.Username, p.Password, p.Enabled)
+WHERE id = $1`, id, p.Name, p.Scheme, p.Host, p.Port, p.Username, p.Password, p.Enabled)
 	if err != nil {
 		return ProxyEntry{}, err
 	}
@@ -187,6 +201,8 @@ func (d *DB) MarkProxyUsed(id int64) error {
 	_, err := d.Exec(`UPDATE proxy_pool SET last_used_at=now() WHERE id=$1`, id)
 	return err
 }
+
+func (src *ProxySource) IsEnabled() bool { return src.Enabled == nil || *src.Enabled }
 
 const proxySourceCols = `id, name, url, enabled, last_sync_at, last_count, last_error, created_at, updated_at`
 
@@ -239,8 +255,15 @@ func (d *DB) GetProxySource(id int64) (ProxySource, error) {
 	return src, err
 }
 
+// ProxySourcePatch 是 UpdateProxySource 的局部更新载荷。
+type ProxySourcePatch struct {
+	Name    *string
+	URL     *string
+	Enabled *bool
+}
+
 // UpdateProxySource 局部更新订阅源。
-func (d *DB) UpdateProxySource(id int64, src ProxySource) (ProxySource, error) {
+func (d *DB) UpdateProxySource(id int64, src ProxySourcePatch) (ProxySource, error) {
 	res, err := d.Exec(`
 UPDATE proxy_sources SET
 	name    = coalesce($2, name),

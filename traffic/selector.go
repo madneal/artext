@@ -1,9 +1,11 @@
 package traffic
 
 import (
+	"encoding/base64"
 	"fmt"
 	"log"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -282,6 +284,71 @@ func banSignal(status int, body []byte) bool {
 	low := strings.ToLower(string(snippet))
 	for _, kw := range banKeywords {
 		if strings.Contains(low, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// ParseSubscription 解析订阅响应体为代理条目列表：每行一个代理 URI
+// （socks5://user:pass@host:port 或 http://...）；响应体允许整体 base64
+// 编码（Clash 等常见导出格式）。非法行跳过，全部非法时报错。
+func ParseSubscription(data []byte) ([]EgressProxy, error) {
+	text := strings.TrimSpace(string(data))
+	if text == "" {
+		return nil, fmt.Errorf("订阅响应为空")
+	}
+	lines := strings.Split(text, "\n")
+	// 不是 URI 行则尝试整体 base64 解码后再拆行。
+	if !looksLikeURI(lines[0]) {
+		if dec, err := base64.StdEncoding.DecodeString(strings.Join(strings.Fields(text), "")); err == nil && looksLikeURI(firstLine(string(dec))) {
+			lines = strings.Split(strings.TrimSpace(string(dec)), "\n")
+		}
+	}
+	var out []EgressProxy
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		u, err := ValidateProxyURL(line)
+		if err != nil {
+			continue
+		}
+		p := EgressProxy{Scheme: u.Scheme, Host: u.Hostname(), Enabled: true, State: "ok"}
+		p.Port, _ = strconv.Atoi(u.Port())
+		if p.Port == 0 {
+			if u.Scheme == "https" {
+				p.Port = 443
+			} else if u.Scheme == "socks5" {
+				p.Port = 1080
+			} else {
+				p.Port = 80
+			}
+		}
+		if u.User != nil {
+			p.Username = u.User.Username()
+			p.Password, _ = u.User.Password()
+		}
+		out = append(out, p)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("订阅内容中没有可解析的代理 URI")
+	}
+	return out, nil
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+func looksLikeURI(s string) bool {
+	s = strings.TrimSpace(s)
+	for _, scheme := range []string{"http://", "https://", "socks5://"} {
+		if strings.HasPrefix(strings.ToLower(s), scheme) {
 			return true
 		}
 	}

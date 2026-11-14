@@ -368,16 +368,23 @@ func (t *Traffic) selectUpstream(req *http.Request) *url.URL {
 
 // ReplaceEgressPool installs (or with nil entries removes) the egress pool
 // selector. Called by the server layer on startup, pool CRUD and subscription
-// sync; pool entries carry their persisted ok/banned/down state.
+// sync; pool entries carry their persisted ok/banned/down state. An existing
+// selector is updated in place — its sticky table and ban cooldowns survive
+// pool reloads, which happen after every state write-back.
 func (t *Traffic) ReplaceEgressPool(entries []EgressProxy, onState func(proxyID int64, state, lastErr string)) {
 	if len(entries) == 0 {
 		t.egress.Store(nil)
 		return
 	}
-	s := newEgressSelector()
-	s.OnEgressState = onState
+	s := t.egress.Load()
+	if s == nil {
+		s = newEgressSelector()
+		s.OnEgressState = onState
+		t.egress.Store(s)
+	} else if onState != nil {
+		s.OnEgressState = onState
+	}
 	s.ReplaceEgressPool(entries)
-	t.egress.Store(s)
 }
 
 // noteEgressBan feeds one recorded response into the ban detector. record() has

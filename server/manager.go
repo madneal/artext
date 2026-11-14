@@ -439,6 +439,9 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 			log.Printf("[proxy] 全局代理 %q 无效，已忽略: %v", m.globalProxy, err)
 		}
 	}
+	// 出口代理池：启动时装载一次，后续由订阅 poller 与 CRUD 变更时刷新。
+	m.refreshEgressPool()
+	m.startSubscriptionPoller()
 	m.enrich = enrich.New(m.assets, m.ProxyAddr, 4)
 	// Reconcile the seeded browser MCP with the persisted capture state, so a
 	// restart with capture already on keeps Playwright routed through the proxy.
