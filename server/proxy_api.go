@@ -38,6 +38,18 @@ func (m *Manager) refreshEgressPool() {
 		eps = append(eps, toEgressProxy(e))
 	}
 	m.traffic.ReplaceEgressPool(eps, m.onEgressState)
+	log.Printf("[egress] 代理池装载 %d 条（enabled %d）", len(eps), enabledCount(eps))
+}
+
+// enabledCount 数池里启用的条目，仅供装载日志。
+func enabledCount(entries []traffic.EgressProxy) int {
+	n := 0
+	for _, e := range entries {
+		if e.Enabled {
+			n++
+		}
+	}
+	return n
 }
 
 // toEgressProxy 把 db 条目转成选路器条目。
@@ -136,8 +148,8 @@ func (m *Manager) SyncProxySource(ctx context.Context, sourceID int64) (int, err
 		if !dup {
 			seq++
 			if _, err := m.pg.CreateProxyEntry(db.ProxyEntry{
-				Name:     fmt.Sprintf("%s #%d", src.Name, seq),
-				Scheme:   p.Scheme, Host: p.Host, Port: p.Port,
+				Name:   fmt.Sprintf("%s #%d", src.Name, seq),
+				Scheme: p.Scheme, Host: p.Host, Port: p.Port,
 				Username: p.Username, Password: p.Password,
 				Source: db.ProxySourceSubscription, SourceID: sourceID,
 			}); err != nil {

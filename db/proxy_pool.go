@@ -32,21 +32,21 @@ var ErrProxySourceNotFound = errors.New("订阅源不存在")
 // ProxyEntry 是池里的一条出口代理。Password 不脱敏返回——代理凭据与既有
 // LLM profile 的 api_key 同级，本就属于管理员可配置项。
 type ProxyEntry struct {
-	ID       int64     `json:"id"`
-	Name     string    `json:"name"`
-	Scheme   string    `json:"scheme"`
-	Host     string    `json:"host"`
-	Port     int       `json:"port"`
-	Username string    `json:"username"`
-	Password string    `json:"password"`
-	Enabled  *bool     `json:"enabled,omitempty"`
-	Source   string    `json:"source"`
-	SourceID int64     `json:"source_id"`
-	State    string    `json:"state"`
-	LastError string   `json:"last_error"`
+	ID         int64      `json:"id"`
+	Name       string     `json:"name"`
+	Scheme     string     `json:"scheme"`
+	Host       string     `json:"host"`
+	Port       int        `json:"port"`
+	Username   string     `json:"username"`
+	Password   string     `json:"password"`
+	Enabled    *bool      `json:"enabled,omitempty"`
+	Source     string     `json:"source"`
+	SourceID   int64      `json:"source_id"`
+	State      string     `json:"state"`
+	LastError  string     `json:"last_error"`
 	LastUsedAt *time.Time `json:"last_used_at"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
 }
 
 // IsEnabled 返回代理是否启用；Enabled 为 nil（未加载）时按启用处理。
@@ -163,7 +163,7 @@ WHERE id = $1`, id, p.Name, p.Scheme, p.Host, p.Port, p.Username, p.Password, p.
 
 // GetProxyEntry 按 id 取一条。
 func (d *DB) GetProxyEntry(id int64) (ProxyEntry, error) {
-	p, err := scanProxyEntry(d.QueryRow(`SELECT ` + proxyEntryCols + ` FROM proxy_pool WHERE id=$1`, id))
+	p, err := scanProxyEntry(d.QueryRow(`SELECT `+proxyEntryCols+` FROM proxy_pool WHERE id=$1`, id))
 	if err == sql.ErrNoRows {
 		return ProxyEntry{}, ErrProxyNotFound
 	}
@@ -248,7 +248,7 @@ func (d *DB) ListProxySources() ([]ProxySource, error) {
 
 // GetProxySource 按 id 取一条。
 func (d *DB) GetProxySource(id int64) (ProxySource, error) {
-	src, err := scanProxySource(d.QueryRow(`SELECT ` + proxySourceCols + ` FROM proxy_sources WHERE id=$1`, id))
+	src, err := scanProxySource(d.QueryRow(`SELECT `+proxySourceCols+` FROM proxy_sources WHERE id=$1`, id))
 	if err == sql.ErrNoRows {
 		return ProxySource{}, ErrProxySourceNotFound
 	}
