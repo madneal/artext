@@ -964,6 +964,39 @@ export interface NotificationFilter {
 
 // NotificationChannel 是一个渠道实例。config 的字段随 kind 而异，
 // 且凭据字段在读取时被替换成 "__masked__" 开头的掩码值——原样回传即表示「不改」。
+// ProxyEntry 是出口代理池里的一条代理。state 由选路器回写：ok 可用 /
+// banned 被目标封禁（30min 冷却）/ down 拨号失败。
+export interface ProxyEntry {
+  id: number;
+  name: string;
+  scheme: string;
+  host: string;
+  port: number;
+  username: string;
+  password: string;
+  enabled: boolean;
+  source: string;
+  source_id: number;
+  state: string;
+  last_error: string;
+  last_used_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+// ProxySource 是一个订阅链接。last_count 是最近一次同步的条目数。
+export interface ProxySource {
+  id: number;
+  name: string;
+  url: string;
+  enabled: boolean;
+  last_sync_at: string | null;
+  last_count: number;
+  last_error: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface NotificationChannel {
   id: number;
   name: string;

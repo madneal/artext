@@ -66,6 +66,8 @@ import type {
   MissingSkill,
   ModelTokenStat,
   NotificationChannel,
+  ProxyEntry,
+  ProxySource,
   NotificationDelivery,
   NotificationFilter,
   NotificationMeta,
@@ -235,6 +237,22 @@ function interceptPageQuery(page: number, size: number, filter: InterceptApprova
 export const api = {
   // 后端应用版本号（release 时由 ldflags 注入，默认 "dev"）。
   health: () => get<{ ok: boolean; service: string; version: string }>("/health"),
+
+  // ---- 出口代理池（阶段 1）----
+  proxyEntries: () => get<{ entries: ProxyEntry[] }>("/proxy/entries").then((r) => arr(r.entries)),
+  createProxyEntry: (input: { name?: string; scheme: string; host: string; port: number; username?: string; password?: string }) =>
+    post<ProxyEntry>("/proxy/entries", input),
+  updateProxyEntry: (id: number, data: { name?: string; scheme?: string; host?: string; port?: number; username?: string; password?: string; enabled?: boolean }) =>
+    patch<ProxyEntry>(`/proxy/entries/${id}`, data),
+  deleteProxyEntry: (id: number) => del<{ ok: boolean }>(`/proxy/entries/${id}`),
+
+  proxySources: () => get<{ sources: ProxySource[] }>("/proxy/sources").then((r) => arr(r.sources)),
+  createProxySource: (input: { name: string; url: string; enabled?: boolean }) =>
+    post<ProxySource>("/proxy/sources", input),
+  updateProxySource: (id: number, data: { name?: string; url?: string; enabled?: boolean }) =>
+    patch<ProxySource>(`/proxy/sources/${id}`, data),
+  deleteProxySource: (id: number) => del<{ ok: boolean }>(`/proxy/sources/${id}`),
+  syncProxySource: (id: number) => post<{ ok: boolean; count: number }>(`/proxy/sources/${id}/sync`),
 
   // ---- auth ----
   authStatus: () => get<{ initialized: boolean }>("/auth/status"),
