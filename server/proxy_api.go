@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -33,12 +34,44 @@ func (m *Manager) refreshEgressPool() {
 		log.Printf("[egress] 读取代理池失败：%v", err)
 		return
 	}
-	eps := make([]traffic.EgressProxy, 0, len(entries))
-	for _, e := range entries {
-		eps = append(eps, toEgressProxy(e))
+	eps, err := m.resolveEgressEntries(entries)
+	if err != nil {
+		log.Printf("[egress] 解析代理池失败：%v", err)
+		return
 	}
 	m.traffic.ReplaceEgressPool(eps, m.onEgressState)
 	log.Printf("[egress] 代理池装载 %d 条（enabled %d）", len(eps), enabledCount(eps))
+}
+
+// resolveEgressEntries 把 db 条目翻译成选路器条目：vless 条目经引擎映射为
+// 本地 socks 出口（scheme/host/port 替换，ID/状态保留），其余原样透传。
+// 引擎仅在存在启用的 vless 条目时重建实例。
+func (m *Manager) resolveEgressEntries(entries []db.ProxyEntry) ([]traffic.EgressProxy, error) {
+	mapping, err := m.egressEngine.Sync(entries)
+	if err != nil {
+		return nil, err
+	}
+	eps := make([]traffic.EgressProxy, 0, len(entries))
+	for _, e := range entries {
+		ep := toEgressProxy(e)
+		if e.Scheme == "vless" {
+			local := mapping[e.ID]
+			if local == "" {
+				// 引擎里没有这条（未启用或启动失败）：跳过，不出现在选路池。
+				continue
+			}
+			u, err := traffic.ValidateProxyURL(local)
+			if err != nil {
+				return nil, err
+			}
+			ep.Scheme = "socks5"
+			ep.Host = u.Hostname()
+			ep.Port, _ = strconv.Atoi(u.Port())
+			ep.Username, ep.Password = "", ""
+		}
+		eps = append(eps, ep)
+	}
+	return eps, nil
 }
 
 // enabledCount 数池里启用的条目，仅供装载日志。
@@ -151,7 +184,8 @@ func (m *Manager) SyncProxySource(ctx context.Context, sourceID int64) (int, err
 				Name:   fmt.Sprintf("%s #%d", src.Name, seq),
 				Scheme: p.Scheme, Host: p.Host, Port: p.Port,
 				Username: p.Username, Password: p.Password,
-				Source: db.ProxySourceSubscription, SourceID: sourceID,
+				Transport: p.Transport,
+				Source:    db.ProxySourceSubscription, SourceID: sourceID,
 			}); err != nil {
 				return 0, fmt.Errorf("写入订阅条目 %s: %w", key, err)
 			}
@@ -218,6 +252,9 @@ type proxyEntryRequest struct {
 	Username *string `json:"username"`
 	Password *string `json:"password"`
 	Enabled  *bool   `json:"enabled"`
+	// URI 允许直接粘贴完整代理链接（vless://… / socks5://…），优先于零散字段。
+	URI       *string         `json:"uri"`
+	Transport json.RawMessage `json:"transport"`
 }
 
 func (s *Server) proxyListEntries(w http.ResponseWriter, r *http.Request) {
@@ -246,15 +283,38 @@ func (s *Server) proxyCreateEntry(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "请求体不是合法 JSON: "+err.Error())
 		return
 	}
-	if req.Scheme == nil || req.Host == nil || req.Port == nil {
-		writeErr(w, 400, "scheme/host/port 必填")
-		return
+	var parsed *traffic.EgressProxy
+	if req.URI != nil && strings.TrimSpace(*req.URI) != "" {
+		p, err := traffic.ParseProxyLine(*req.URI)
+		if err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+		parsed = &p
 	}
-	entry, err := pg.CreateProxyEntry(db.ProxyEntry{
-		Name: strOr(req.Name), Scheme: *req.Scheme, Host: strings.TrimSpace(*req.Host),
-		Port: *req.Port, Username: strOr(req.Username), Password: strOr(req.Password),
+	var scheme, host string
+	var port int
+	if parsed != nil {
+		scheme, host, port = parsed.Scheme, parsed.Host, parsed.Port
+	} else {
+		if req.Scheme == nil || req.Host == nil || req.Port == nil {
+			writeErr(w, 400, "scheme/host/port 必填（或直接提供 uri）")
+			return
+		}
+		scheme, host, port = *req.Scheme, strings.TrimSpace(*req.Host), *req.Port
+	}
+	create := db.ProxyEntry{
+		Name: strOr(req.Name), Scheme: scheme, Host: host, Port: port,
+		Username: strOr(req.Username), Password: strOr(req.Password),
 		Source: db.ProxySourceManual,
-	})
+	}
+	if parsed != nil && parsed.Scheme == "vless" {
+		create.Transport = parsed.Transport
+	} else if req.Scheme != nil && db.ValidProxyScheme(*req.Scheme) && strings.EqualFold(*req.Scheme, "vless") {
+		// 零散字段 + transport JSON 的表单路径
+		create.Transport = req.Transport
+	}
+	entry, err := pg.CreateProxyEntry(create)
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
@@ -285,6 +345,7 @@ func (s *Server) proxyUpdateEntry(w http.ResponseWriter, r *http.Request) {
 	patch := db.ProxyEntryPatch{
 		Name: req.Name, Scheme: req.Scheme, Host: req.Host, Port: req.Port,
 		Username: req.Username, Password: req.Password, Enabled: req.Enabled,
+		Transport: req.Transport,
 	}
 	entry, err := pg.UpdateProxyEntry(id, patch)
 	if err != nil {
