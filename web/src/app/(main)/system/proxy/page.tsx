@@ -15,9 +15,10 @@ import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
-import type { ProxyEntry, ProxySource } from "@/lib/types";
+import type { ProxyEntry, ProxySource, VLESSTransport } from "@/lib/types";
 
-// 出口代理池管理页（阶段 1）。选路/粘性/封禁逻辑在后端 traffic/selector.go；
+// 出口代理池管理页（阶段 1 + 1.5）。选路/粘性/封禁逻辑在后端 traffic/selector.go；
+// vless 条目由后端内嵌 sing-box 引擎翻译成本地 socks 出口（server/egress_engine.go），
 // 本页只做池与订阅源的 CRUD 和手动同步。池为空时出口回退到「系统配置」里的
 // 全局代理（再退到直连），所以本页空着不影响现有行为。
 
@@ -38,6 +39,17 @@ function fmtTime(v: string | null): string {
   return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString();
 }
 
+// vlessSummary 生成列表里 transport 摘要（TLS/WS/Reality…）。
+function vlessSummary(t?: VLESSTransport): string {
+  if (!t) return "";
+  const parts: string[] = [t.security === "none" || !t.security ? "tcp" : (t.transport || "tcp")];
+  if (t.security && t.security !== "none") parts.push(t.security);
+  if (t.flow) parts.push(t.flow);
+  return parts.join(" · ");
+}
+
+const emptyVless = (): VLESSTransport => ({ uuid: "", security: "tls", transport: "tcp" });
+
 export default function ProxyPoolPage() {
   const [entries, setEntries] = React.useState<ProxyEntry[]>([]);
   const [sources, setSources] = React.useState<ProxySource[]>([]);
@@ -46,12 +58,14 @@ export default function ProxyPoolPage() {
 
   // 手动添加表单
   const [scheme, setScheme] = React.useState("http");
+  const [pastedURI, setPastedURI] = React.useState("");
   const [host, setHost] = React.useState("");
   const [port, setPort] = React.useState("");
   const [username, setUsername] = React.useState("");
   const [password, setPassword] = React.useState("");
   const [name, setName] = React.useState("");
   const [saving, setSaving] = React.useState(false);
+  const [vless, setVless] = React.useState<VLESSTransport>(emptyVless());
 
   // 订阅源表单
   const [srcName, setSrcName] = React.useState("");
@@ -72,21 +86,50 @@ export default function ProxyPoolPage() {
     load();
   }, [load]);
 
+  function setV(patch: Partial<VLESSTransport>) {
+    setVless((v) => ({ ...v, ...patch }));
+  }
+
   async function addEntry() {
-    const p = Number(port);
-    if (!host.trim() || !p) {
-      toast.error("请填写主机地址和端口");
-      return;
-    }
     setSaving(true);
     try {
-      await api.createProxyEntry({ name: name.trim(), scheme, host: host.trim(), port: p, username: username.trim(), password });
+      if (scheme === "vless" && pastedURI.trim()) {
+        await api.createProxyEntry({ name: name.trim(), uri: pastedURI.trim() });
+      } else if (scheme === "vless") {
+        if (!host.trim() || !vless.uuid.trim()) {
+          toast.error("vless 节点需要主机地址和 UUID");
+          return;
+        }
+        await api.createProxyEntry({
+          name: name.trim(),
+          scheme: "vless",
+          host: host.trim(),
+          port: Number(port),
+          transport: { ...vless },
+        });
+      } else {
+        const p = Number(port);
+        if (!host.trim() || !p) {
+          toast.error("请填写主机地址和端口");
+          return;
+        }
+        await api.createProxyEntry({
+          name: name.trim(),
+          scheme,
+          host: host.trim(),
+          port: p,
+          username: username.trim(),
+          password,
+        });
+      }
       toast.success("代理已加入池");
+      setPastedURI("");
       setName("");
       setHost("");
       setPort("");
       setUsername("");
       setPassword("");
+      setVless(emptyVless());
       load();
     } catch (err) {
       toast.error("添加失败：" + (err as Error).message);
@@ -161,7 +204,8 @@ export default function ProxyPoolPage() {
       <div>
         <h1 className="text-2xl font-semibold">出口代理池</h1>
         <p className="text-muted-foreground mt-1 text-sm">
-          同一目标走同一出口（粘性）；命中封禁信号或拨号失败自动换下一条。池为空时回退到系统配置里的全局代理，再退直连。
+          同一目标走同一出口（粘性）；命中封禁信号或拨号失败自动换下一条。vless 节点由内置 sing-box
+          引擎接管，每节点一个独立出口。池为空时回退到系统配置里的全局代理，再退直连。
         </p>
       </div>
 
@@ -176,45 +220,138 @@ export default function ProxyPoolPage() {
             <CardHeader>
               <CardTitle className="text-base">手动添加代理</CardTitle>
             </CardHeader>
-            <CardContent className="grid grid-cols-2 gap-3 md:grid-cols-6">
-              <div className="col-span-1">
-                <Label>协议</Label>
-                <Select value={scheme} onValueChange={setScheme}>
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="http">http</SelectItem>
-                    <SelectItem value="https">https</SelectItem>
-                    <SelectItem value="socks5">socks5</SelectItem>
-                  </SelectContent>
-                </Select>
+            <CardContent className="flex flex-col gap-3">
+              <div className="grid grid-cols-2 gap-3 md:grid-cols-6">
+                <div className="col-span-1">
+                  <Label>协议</Label>
+                  <Select value={scheme} onValueChange={setScheme}>
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="http">http</SelectItem>
+                      <SelectItem value="https">https</SelectItem>
+                      <SelectItem value="socks5">socks5</SelectItem>
+                      <SelectItem value="vless">vless</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                {scheme === "vless" ? (
+                  <div className="col-span-2 md:col-span-4">
+                    <Label>粘贴分享链接（优先）</Label>
+                    <Input
+                      value={pastedURI}
+                      onChange={(e) => setPastedURI(e.target.value)}
+                      placeholder="vless://uuid@host:port?security=tls&type=ws&sni=…&path=/…"
+                    />
+                  </div>
+                ) : (
+                  <>
+                    <div className="col-span-2">
+                      <Label>主机</Label>
+                      <Input value={host} onChange={(e) => setHost(e.target.value)} placeholder="proxy.example.com" />
+                    </div>
+                    <div className="col-span-1">
+                      <Label>端口</Label>
+                      <Input value={port} onChange={(e) => setPort(e.target.value)} placeholder="8080" inputMode="numeric" />
+                    </div>
+                    <div className="col-span-1">
+                      <Label>用户名</Label>
+                      <Input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="可选" />
+                    </div>
+                  </>
+                )}
+                <div className="col-span-1 md:col-span-1">
+                  <Label>备注</Label>
+                  <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="可选" />
+                </div>
               </div>
-              <div className="col-span-2">
-                <Label>主机</Label>
-                <Input value={host} onChange={(e) => setHost(e.target.value)} placeholder="proxy.example.com" />
-              </div>
-              <div className="col-span-1">
-                <Label>端口</Label>
-                <Input value={port} onChange={(e) => setPort(e.target.value)} placeholder="8080" inputMode="numeric" />
-              </div>
-              <div className="col-span-1">
-                <Label>用户名</Label>
-                <Input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="可选" />
-              </div>
-              <div className="col-span-1">
-                <Label>密码</Label>
-                <Input value={password} onChange={(e) => setPassword(e.target.value)} placeholder="可选" type="password" />
-              </div>
-              <div className="col-span-2 md:col-span-4">
-                <Label>备注</Label>
-                <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="可选，方便识别" />
-              </div>
-              <div className="col-span-2 flex items-end md:col-span-2">
-                <Button onClick={addEntry} disabled={saving} className="w-full">
-                  <PlusIcon /> {saving ? "添加中…" : "添加"}
-                </Button>
-              </div>
+
+              {scheme === "vless" && !pastedURI.trim() && (
+                <div className="grid grid-cols-2 gap-3 md:grid-cols-6">
+                  <div className="col-span-2">
+                    <Label>UUID</Label>
+                    <Input value={vless.uuid} onChange={(e) => setV({ uuid: e.target.value })} />
+                  </div>
+                  <div className="col-span-1">
+                    <Label>加密层</Label>
+                    <Select value={vless.security} onValueChange={(v) => setV({ security: v as VLESSTransport["security"] })}>
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="none">none</SelectItem>
+                        <SelectItem value="tls">tls</SelectItem>
+                        <SelectItem value="reality">reality</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="col-span-1">
+                    <Label>传输层</Label>
+                    <Select value={vless.transport} onValueChange={(v) => setV({ transport: v as VLESSTransport["transport"] })}>
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="tcp">tcp</SelectItem>
+                        <SelectItem value="ws">ws</SelectItem>
+                        <SelectItem value="grpc">grpc</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="col-span-1">
+                    <Label>SNI</Label>
+                    <Input value={vless.sni ?? ""} onChange={(e) => setV({ sni: e.target.value })} placeholder={vless.security === "tls" ? "可选" : "reality 必填"} />
+                  </div>
+                  <div className="col-span-1">
+                    <Label>flow</Label>
+                    <Input value={vless.flow ?? ""} onChange={(e) => setV({ flow: e.target.value })} placeholder="xtls-rprx-vision" />
+                  </div>
+                  {vless.transport === "ws" && (
+                    <>
+                      <div className="col-span-1">
+                        <Label>WS Host</Label>
+                        <Input value={vless.ws_host ?? ""} onChange={(e) => setV({ ws_host: e.target.value })} />
+                      </div>
+                      <div className="col-span-2">
+                        <Label>WS Path</Label>
+                        <Input value={vless.ws_path ?? ""} onChange={(e) => setV({ ws_path: e.target.value })} placeholder="/path" />
+                      </div>
+                    </>
+                  )}
+                  {vless.transport === "grpc" && (
+                    <div className="col-span-2">
+                      <Label>gRPC serviceName</Label>
+                      <Input value={vless.grpc_service ?? ""} onChange={(e) => setV({ grpc_service: e.target.value })} />
+                    </div>
+                  )}
+                  {vless.security === "reality" && (
+                    <>
+                      <div className="col-span-2">
+                        <Label>Reality 公钥 (pbk)</Label>
+                        <Input value={vless.reality_pbk ?? ""} onChange={(e) => setV({ reality_pbk: e.target.value })} />
+                      </div>
+                      <div className="col-span-1">
+                        <Label>shortId (sid)</Label>
+                        <Input value={vless.reality_sid ?? ""} onChange={(e) => setV({ reality_sid: e.target.value })} />
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+
+              {scheme !== "vless" && (
+                <div className="grid grid-cols-2 gap-3 md:grid-cols-6">
+                  <div className="col-span-2 md:col-span-4">
+                    <Label>密码</Label>
+                    <Input value={password} onChange={(e) => setPassword(e.target.value)} placeholder="可选" type="password" />
+                  </div>
+                </div>
+              )}
+
+              <Button onClick={addEntry} disabled={saving} className="w-fit">
+                <PlusIcon /> {saving ? "添加中…" : "添加"}
+              </Button>
             </CardContent>
           </Card>
 
@@ -224,6 +361,7 @@ export default function ProxyPoolPage() {
                 <TableHeader>
                   <TableRow>
                     <TableHead>地址</TableHead>
+                    <TableHead>传输层</TableHead>
                     <TableHead>备注</TableHead>
                     <TableHead>来源</TableHead>
                     <TableHead>状态</TableHead>
@@ -235,13 +373,13 @@ export default function ProxyPoolPage() {
                 <TableBody>
                   {loading ? (
                     <TableRow>
-                      <TableCell colSpan={7} className="text-muted-foreground text-center">
+                      <TableCell colSpan={8} className="text-muted-foreground text-center">
                         加载中…
                       </TableCell>
                     </TableRow>
                   ) : entries.length === 0 ? (
                     <TableRow>
-                      <TableCell colSpan={7} className="text-muted-foreground text-center">
+                      <TableCell colSpan={8} className="text-muted-foreground text-center">
                         池为空——当前出口走全局代理/直连
                       </TableCell>
                     </TableRow>
@@ -251,8 +389,16 @@ export default function ProxyPoolPage() {
                       return (
                         <TableRow key={e.id}>
                           <TableCell className="font-mono text-sm">
-                            {e.scheme}://{e.host}:{e.port}
-                            {e.username ? ` (${e.username})` : ""}
+                            {e.scheme === "vless"
+                              ? `vless://${e.host}:${e.port}`
+                              : `${e.scheme}://${e.host}:${e.port}${e.username ? ` (${e.username})` : ""}`}
+                          </TableCell>
+                          <TableCell>
+                            {e.scheme === "vless" ? (
+                              <Badge variant="secondary">{vlessSummary(e.transport)}</Badge>
+                            ) : (
+                              "—"
+                            )}
                           </TableCell>
                           <TableCell className="text-sm">{e.name || "—"}</TableCell>
                           <TableCell>
@@ -303,7 +449,7 @@ export default function ProxyPoolPage() {
                 </Button>
               </div>
               <p className="text-muted-foreground text-xs md:col-span-4">
-                格式：每行一个代理 URI（socks5://user:pass@host:port 或 http://…），响应可为 base64 整体编码。每 10 分钟自动同步。
+                格式：每行一个代理 URI（socks5://、http://、vless://…），响应可为 base64 整体编码。每 10 分钟自动同步。
               </p>
             </CardContent>
           </Card>

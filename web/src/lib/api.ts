@@ -67,6 +67,7 @@ import type {
   ModelTokenStat,
   NotificationChannel,
   ProxyEntry,
+  VLESSTransport,
   ProxySource,
   NotificationDelivery,
   NotificationFilter,
@@ -240,10 +241,20 @@ export const api = {
 
   // ---- 出口代理池（阶段 1）----
   proxyEntries: () => get<{ entries: ProxyEntry[] }>("/proxy/entries").then((r) => arr(r.entries)),
-  createProxyEntry: (input: { name?: string; scheme: string; host: string; port: number; username?: string; password?: string }) =>
-    post<ProxyEntry>("/proxy/entries", input),
-  updateProxyEntry: (id: number, data: { name?: string; scheme?: string; host?: string; port?: number; username?: string; password?: string; enabled?: boolean }) =>
-    patch<ProxyEntry>(`/proxy/entries/${id}`, data),
+  createProxyEntry: (input: {
+    name?: string;
+    scheme?: string;
+    host?: string;
+    port?: number;
+    username?: string;
+    password?: string;
+    uri?: string;
+    transport?: VLESSTransport;
+  }) => post<ProxyEntry>("/proxy/entries", input),
+  updateProxyEntry: (
+    id: number,
+    data: { name?: string; scheme?: string; host?: string; port?: number; username?: string; password?: string; enabled?: boolean; transport?: VLESSTransport },
+  ) => patch<ProxyEntry>(`/proxy/entries/${id}`, data),
   deleteProxyEntry: (id: number) => del<{ ok: boolean }>(`/proxy/entries/${id}`),
 
   proxySources: () => get<{ sources: ProxySource[] }>("/proxy/sources").then((r) => arr(r.sources)),

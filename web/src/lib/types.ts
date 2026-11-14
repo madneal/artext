@@ -966,6 +966,23 @@ export interface NotificationFilter {
 // 且凭据字段在读取时被替换成 "__masked__" 开头的掩码值——原样回传即表示「不改」。
 // ProxyEntry 是出口代理池里的一条代理。state 由选路器回写：ok 可用 /
 // banned 被目标封禁（30min 冷却）/ down 拨号失败。
+// VLESSTransport 是 vless 条目的传输层参数，与后端 traffic.VLESSTransport 对应。
+export interface VLESSTransport {
+  uuid: string;
+  flow?: string;
+  security: "none" | "tls" | "reality";
+  sni?: string;
+  fp?: string;
+  alpn?: string;
+  transport: "tcp" | "ws" | "grpc";
+  ws_host?: string;
+  ws_path?: string;
+  grpc_service?: string;
+  reality_pbk?: string;
+  reality_sid?: string;
+  reality_spx?: string;
+}
+
 export interface ProxyEntry {
   id: number;
   name: string;
@@ -975,6 +992,7 @@ export interface ProxyEntry {
   username: string;
   password: string;
   enabled: boolean;
+  transport?: VLESSTransport;
   source: string;
   source_id: number;
   state: string;
