@@ -2,6 +2,7 @@ package traffic
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/url"
@@ -24,6 +25,7 @@ import (
 const banCooldown = 30 * time.Minute
 
 // EgressProxy 是选路器视角的一条出口代理，由 server 层从 db.ProxyEntry 转换而来。
+// vless 条目不经选路器直接拨号：server 引擎把它翻译成本地 socks 出口后再进池。
 type EgressProxy struct {
 	ID       int64
 	Scheme   string
@@ -33,6 +35,9 @@ type EgressProxy struct {
 	Password string
 	Enabled  bool
 	State    string // ok / banned / down（db 持久状态）
+	// Transport 是 vless 条目的传输层参数（VLESSTransport 的 JSON），非 vless 为 nil。
+	// 只用于 server 层构造 sing-box outbound，选路器本身不读它。
+	Transport json.RawMessage
 }
 
 // URL 组装该代理的代理 URL，供 go-mitmproxy 拨号使用。
@@ -311,24 +316,9 @@ func ParseSubscription(data []byte) ([]EgressProxy, error) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		u, err := ValidateProxyURL(line)
+		p, err := ParseProxyLine(line)
 		if err != nil {
 			continue
-		}
-		p := EgressProxy{Scheme: u.Scheme, Host: u.Hostname(), Enabled: true, State: "ok"}
-		p.Port, _ = strconv.Atoi(u.Port())
-		if p.Port == 0 {
-			if u.Scheme == "https" {
-				p.Port = 443
-			} else if u.Scheme == "socks5" {
-				p.Port = 1080
-			} else {
-				p.Port = 80
-			}
-		}
-		if u.User != nil {
-			p.Username = u.User.Username()
-			p.Password, _ = u.User.Password()
 		}
 		out = append(out, p)
 	}
@@ -336,6 +326,35 @@ func ParseSubscription(data []byte) ([]EgressProxy, error) {
 		return nil, fmt.Errorf("订阅内容中没有可解析的代理 URI")
 	}
 	return out, nil
+}
+
+// ParseProxyLine 解析一行代理 URI（http/https/socks5/vless），手动录入与订阅
+// 解析共用。http/https 缺省端口按协议补齐；vless 走 ParseVLESSURI。
+func ParseProxyLine(line string) (EgressProxy, error) {
+	line = strings.TrimSpace(line)
+	if strings.HasPrefix(strings.ToLower(line), "vless://") {
+		return ParseVLESSURI(line)
+	}
+	u, err := ValidateProxyURL(line)
+	if err != nil {
+		return EgressProxy{}, err
+	}
+	p := EgressProxy{Scheme: u.Scheme, Host: u.Hostname(), Enabled: true, State: "ok"}
+	p.Port, _ = strconv.Atoi(u.Port())
+	if p.Port == 0 {
+		if u.Scheme == "https" {
+			p.Port = 443
+		} else if u.Scheme == "socks5" {
+			p.Port = 1080
+		} else {
+			p.Port = 80
+		}
+	}
+	if u.User != nil {
+		p.Username = u.User.Username()
+		p.Password, _ = u.User.Password()
+	}
+	return p, nil
 }
 
 func firstLine(s string) string {
@@ -347,7 +366,7 @@ func firstLine(s string) string {
 
 func looksLikeURI(s string) bool {
 	s = strings.TrimSpace(s)
-	for _, scheme := range []string{"http://", "https://", "socks5://"} {
+	for _, scheme := range []string{"http://", "https://", "socks5://", "vless://"} {
 		if strings.HasPrefix(strings.ToLower(s), scheme) {
 			return true
 		}
