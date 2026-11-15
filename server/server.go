@@ -68,6 +68,10 @@ type Server struct {
 	// concurrent messages don't corrupt the shared exp<id>-main transcript.
 	chatMu   sync.Mutex
 	chatBusy map[string]bool
+	// chatPending 是「Codex 模式」的排队注入队列：主 Agent 运行中用户再发的消息
+	// 不再 409，而是立即 emit 用户气泡 + 入队；当前回合结束后由 turn 循环 drain，
+	// 多条合并为一个新回合的输入。键=taskID，chatMu 保护。见 chat()/chatLoop()。
+	chatPending map[string][]string
 	// chatCancel holds the cancel func for each in-flight conversation run (keyed by
 	// convBusyKey), so a manual stop can abort JUST that session's agent run. Set/
 	// cleared alongside chatBusy under chatMu. Aborting a run does NOT touch the P3
@@ -146,7 +150,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		log.Fatalf("[auth] JWT key: %v", err)
 	}
 	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, jwtKey: key, chatBusy: map[string]bool{},
-		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
+		chatPending: map[string][]string{}, chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
@@ -3691,6 +3695,14 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// 停止后残留的排队消息并入本次输入（见回合循环的 drain 语义：用户消息永不丢失）。
+	s.chatMu.Lock()
+	leftover := s.chatPending[t.ID]
+	s.chatPending[t.ID] = nil
+	s.chatMu.Unlock()
+	if len(leftover) > 0 {
+		agentMessage = strings.Join(append(leftover, agentMessage), "\n\n")
+	}
 	// Admission is serialized with deletion's chat cancellation. Mark every chat
 	// turn busy before its first activity/file write, including rule-mode turns.
 	// If deletion wins the race, the second barrier check rejects this request.
@@ -3700,9 +3712,21 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, "任务正在删除，无法发送新消息")
 		return
 	}
+	// Codex 模式排队注入：主 Agent 运行中再发的消息不再 409——立即 emit 用户
+	// 气泡（activity 落库 + SSE），agentMessage 入队，当前回合结束后由 turn 循环
+	// 自动消费。不注册新 cancel：沿用正在运行的回合。
 	if s.chatBusy[t.ID] {
+		s.chatPending[t.ID] = append(s.chatPending[t.ID], agentMessage)
+		mainSegQ, _ := t.Store.CurrentMainSeg()
+		if req.Seg != nil && *req.Seg >= 0 {
+			mainSegQ = *req.Seg
+		}
+		segQ := &mainSegQ
+		humanTurnQ := userActivityWithAttachments("mainagent", req.Message, req.Attachments)
+		humanTurnQ.MainSeg = segQ
+		s.engine.emitActivity(t, humanTurnQ)
 		s.chatMu.Unlock()
-		writeErr(w, 409, "主 Agent 正在处理上一条消息，请稍候")
+		writeJSON(w, 202, map[string]any{"status": "queued", "pending": len(s.chatPending[t.ID])})
 		return
 	}
 	ctx, cancel := context.WithCancelCause(s.ctx)
@@ -3757,12 +3781,28 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			// 把上传附件的【绝对路径】清单拼进发给 agent 的消息,它据此用 Read/Bash 打开文件。
 			// taskDir = agent 的工作目录(CWD),与 chatUpload 落盘、ensureRunDir 一致。
 			taskDir := filepath.Join(s.m.dir, "tasks", t.ID)
+			// Codex 模式回合循环：跑完一回合后 drain 排队消息，非空则以合并输入
+			// 开启下一回合，直到队列空或用户停止。停止时队列保留（用户消息不丢），
+			// 下次非 busy 发送时会并入输入。
 			agentMsg := composeAgentMessage(agentMessage, req.Attachments, taskDir)
-			s.engine.BeginLLMCall(t.ID)
-			_, err := ma.Chat(ctx, maTaskID, mainSeg, s.m.Assets(), t.Store, t.Goal, agentMsg, emit, t.Notify, resume, t.NotifyGoal, t.NotifyHint)
-			s.engine.EndLLMCall(t.ID)
-			if err != nil && ctx.Err() == nil {
-				s.engine.emitActivity(t, db.Activity{Worker: "mainagent", Kind: "text", IsError: true, Summary: "（主 Agent 出错：" + err.Error() + "）", MainSeg: segPtr})
+			for {
+				s.engine.BeginLLMCall(t.ID)
+				_, err := ma.Chat(ctx, maTaskID, mainSeg, s.m.Assets(), t.Store, t.Goal, agentMsg, emit, t.Notify, resume, t.NotifyGoal, t.NotifyHint)
+				s.engine.EndLLMCall(t.ID)
+				if err != nil && ctx.Err() == nil {
+					s.engine.emitActivity(t, db.Activity{Worker: "mainagent", Kind: "text", IsError: true, Summary: "（主 Agent 出错：" + err.Error() + "）", MainSeg: segPtr})
+				}
+				if ctx.Err() != nil {
+					return // 用户停止：保留队列，下次发送并入
+				}
+				s.chatMu.Lock()
+				pending := s.chatPending[t.ID]
+				s.chatPending[t.ID] = nil
+				s.chatMu.Unlock()
+				if len(pending) == 0 {
+					return
+				}
+				agentMsg = strings.Join(pending, "\n\n")
 			}
 		}()
 		writeJSON(w, 202, map[string]any{"status": "accepted", "mode": "llm"})
@@ -3803,8 +3843,9 @@ func (s *Server) taskChatStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	s.chatMu.Lock()
 	running := s.chatBusy[t.ID]
+	pending := len(s.chatPending[t.ID])
 	s.chatMu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]bool{"running": running})
+	writeJSON(w, http.StatusOK, map[string]any{"running": running, "pending": pending})
 }
 
 // stopChat aborts the in-flight main-agent turn for a task (manual stop button).
