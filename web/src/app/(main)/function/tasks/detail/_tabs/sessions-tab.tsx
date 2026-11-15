@@ -533,6 +533,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   const [sending, setSending] = React.useState(false);
   const [stopping, setStopping] = React.useState(false);
   const [mainChatRunning, setMainChatRunning] = React.useState<boolean | null>(null);
+  const [mainChatPending, setMainChatPending] = React.useState(0);
   const [controllingIntent, setControllingIntent] = React.useState<string | null>(null);
   const [cancelIntent, setCancelIntent] = React.useState<Session | null>(null);
   const [cancelReason, setCancelReason] = React.useState("");
@@ -809,8 +810,11 @@ export function SessionsTab({ taskId }: { taskId: string }) {
       const request = ++chatStatusRequestRef.current;
       return api
         .chatStatus(taskId)
-        .then(({ running }) => {
-          if (alive && chatStatusRequestRef.current === request) setMainChatRunning(running);
+        .then(({ running, pending }) => {
+          if (alive && chatStatusRequestRef.current === request) {
+            setMainChatRunning(running);
+            setMainChatPending(pending);
+          }
         })
         .catch(() => {
           // Keep the last authoritative value. Before the first success, recent
@@ -1496,7 +1500,8 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     const text = input.trim();
     const atts = attachments;
     if (side.handleCommand(text, () => setInput(""))) return;
-    if ((!text && atts.length === 0) || sending || mainBusy) return;
+    if ((!text && atts.length === 0) || sending) return;
+    const willQueue = mainBusy;
     // No optimistic echo: the backend persists+broadcasts the human turn before it
     // returns, so it streams back over SSE (worker="mainagent") with its real DB
     // seq — the transcript renders it from server data like every other step. Clear
@@ -1507,9 +1512,12 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     chatStatusRequestRef.current++;
     api
       .chat(text, taskId, atts.length > 0 ? atts : undefined, active.seg ?? 0)
-      .then(({ mode }) => {
+      .then(({ mode, status }) => {
         chatStatusRequestRef.current++;
         setMainChatRunning(mode === "llm");
+        if (willQueue || status === "queued") {
+          toast.success("已插入队列，主 Agent 当前执行结束后自动处理");
+        }
       })
       .catch((e) => {
         setInput(text); // restore so the user doesn't lose their text / attachments
@@ -1941,13 +1949,22 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                   className="hidden"
                   onChange={(e) => void pickFiles(e.target.files)}
                 />
+                {mainBusy && mainChatPending > 0 && (
+                  <div className="text-muted-foreground mb-1.5 flex items-center gap-1.5 text-[11px]">
+                    <span className="inline-flex items-center rounded-md border bg-muted/50 px-2 py-0.5">
+                      已插入 {mainChatPending} 条 · 当前执行结束后自动处理
+                    </span>
+                  </div>
+                )}
                 <InputGroup className="min-h-9 has-disabled:opacity-100">
                   <MentionTextarea
                     inputGroup
                     rows={1}
                     aria-label="给主 Agent 发消息"
                     placeholder={
-                      mainBusy ? "主 Agent 正在运行，可输入 /btw 提问…" : "给主 Agent 发消息，@ 引用漏洞、资产等…"
+                      mainBusy
+                        ? "主 Agent 正在运行，输入会插入队列（/btw 旁路提问）"
+                        : "给主 Agent 发消息，@ 引用漏洞、资产等…"
                     }
                     value={input}
                     disabled={sending}
@@ -1971,18 +1988,15 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                       size="icon-xs"
                       variant="ghost"
                       onClick={() => fileInputRef.current?.click()}
-                      disabled={mainBusy || uploading}
-                      title="上传文件"
+                      disabled={uploading}
+                      title="上传文件（运行中粘贴/选择将随队列插入）"
                       aria-label="上传文件"
                     >
                       {uploading ? <Loader2Icon className="animate-spin" /> : <PaperclipIcon />}
                     </InputGroupButton>
-                    {mainBusy && isBtwCommand(input) && (
-                      <InputGroupButton size="icon-xs" onClick={send} aria-label="发送旁路问题">
-                        <ArrowUpIcon />
-                      </InputGroupButton>
-                    )}
-                    {mainBusy ? (
+                    {mainBusy && (
+                      // Codex 模式：运行中 stop 与 send 并存——send 把消息插入队列，
+                      // 当前回合结束后自动处理；/btw 输入自动走旁路提问。
                       <InputGroupButton
                         className="ml-auto"
                         size="icon-xs"
@@ -1994,19 +2008,18 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                       >
                         {stopping ? <Loader2Icon className="animate-spin" /> : <SquareIcon />}
                       </InputGroupButton>
-                    ) : (
-                      <InputGroupButton
-                        className="ml-auto"
-                        size="icon-xs"
-                        variant="default"
-                        onClick={send}
-                        disabled={(!input.trim() && attachments.length === 0) || sending}
-                        title="发送消息"
-                        aria-label="发送消息"
-                      >
-                        {sending ? <Loader2Icon className="animate-spin" /> : <ArrowUpIcon />}
-                      </InputGroupButton>
                     )}
+                    <InputGroupButton
+                      className={mainBusy ? "" : "ml-auto"}
+                      size="icon-xs"
+                      variant="default"
+                      onClick={send}
+                      disabled={(!input.trim() && attachments.length === 0) || sending}
+                      title={mainBusy ? "插入队列（当前执行结束后处理）" : "发送消息"}
+                      aria-label={mainBusy ? "插入队列" : "发送消息"}
+                    >
+                      {sending ? <Loader2Icon className="animate-spin" /> : <ArrowUpIcon />}
+                    </InputGroupButton>
                   </InputGroupAddon>
                 </InputGroup>
               </div>

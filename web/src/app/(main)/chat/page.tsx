@@ -245,7 +245,7 @@ function Composer({
           rows={1}
           placeholder={placeholder}
           value={value}
-          disabled={disabled && !(running && allowBtw)}
+          disabled={disabled}
           onValueChange={onChange}
           onKeyDown={onKeyDown}
           onPaste={(e) => {
@@ -258,28 +258,22 @@ function Composer({
             onPickFiles(files);
           }}
         />
-        {running && allowBtw && isBtwCommand(value) && (
-          <Button size="icon" onClick={onSend} aria-label="发送旁路问题" title="发送旁路问题">
-            <ArrowUpIcon />
-          </Button>
-        )}
-        {running ? (
-          // while a run is in flight the send button becomes a stop button —
-          // aborts just this session (the trigger queue keeps going).
+        {running && (
+          // while a run is in flight the stop button aborts just this session
+          // (the trigger queue keeps going); the send button inserts into the queue.
           <Button size="icon" variant="destructive" onClick={onStop} disabled={stopDisabled} title="停止本次运行">
             <Square className="size-3.5 fill-current" />
           </Button>
-        ) : (
-          <Button
-            size="icon"
-            onClick={onSend}
-            disabled={disabled || (!value.trim() && atts.length === 0)}
-            title="发送消息"
-            aria-label="发送消息"
-          >
-            <ArrowUpIcon />
-          </Button>
         )}
+        <Button
+          size="icon"
+          onClick={onSend}
+          disabled={disabled || (!value.trim() && atts.length === 0)}
+          title={running ? "插入队列（当前执行结束后处理）" : "发送消息"}
+          aria-label={running ? "插入队列" : "发送消息"}
+        >
+          <ArrowUpIcon />
+        </Button>
       </div>
     </div>
   );
@@ -735,15 +729,19 @@ function ChatView({
     const msg = input.trim();
     const atts = attachments;
     if (side.handleCommand(msg, () => setInput(""))) return;
-    if ((!msg && atts.length === 0) || sending || running) return;
+    if ((!msg && atts.length === 0) || sending) return;
+    const willQueue = running;
     setSending(true);
     setInput("");
     setAttachments([]);
     try {
-      await api.sendConversationMessage(conv.id, msg, atts.length ? atts : undefined);
+      const r = await api.sendConversationMessage(conv.id, msg, atts.length ? atts : undefined);
       // The live loop pulls the persisted human turn immediately. Sharing that
       // fetch avoids racing a separate post-send request against the poller.
       setRunning(true);
+      if (willQueue || r.status === "queued") {
+        toast.success("已插入队列，Agent 当前执行结束后自动处理");
+      }
     } catch (e) {
       toast.error("发送失败：" + (e as Error).message);
       setInput(msg); // restore so the user doesn't lose their text
@@ -823,9 +821,9 @@ function ChatView({
         value={input}
         onChange={setInput}
         onSend={send}
-        disabled={running || sending}
+        disabled={sending}
         allowBtw
-        placeholder={running ? "Agent 正在回复，可输入 /btw 提问…" : "输入消息，@ 引用记录，Enter 发送"}
+        placeholder={running ? "Agent 正在运行，输入会插入队列（/btw 旁路提问）" : "输入消息，@ 引用记录，Enter 发送"}
         running={running}
         onStop={stop}
         stopDisabled={stopping}
