@@ -4,6 +4,7 @@ import * as React from "react";
 import {
   CheckIcon,
   ChevronDown,
+  CopyIcon,
   ChevronRight,
   CrosshairIcon,
   Flag,
@@ -471,9 +472,15 @@ function ToolBlock({
         <span className={"ml-auto shrink-0 font-medium " + statusTone}>{statusText}</span>
       </button>
       {open && (
-        <pre className="ml-7 mb-1 max-h-72 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/50 p-2 font-mono text-[11px] leading-relaxed">
-          {detail ?? "加载中…"}
-        </pre>
+        <div className="relative ml-7 mb-1">
+          <CopyButton
+            text={detail ?? ""}
+            className="absolute top-1 right-2 bg-muted/50 p-1"
+          />
+          <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/50 p-2 pr-8 font-mono text-[11px] leading-relaxed">
+            {detail ?? "加载中…"}
+          </pre>
+        </div>
       )}
     </section>
   );
@@ -540,9 +547,15 @@ function MessageBlock({
         </span>
       </button>
       {open && (
-        <pre className="ml-7 mb-1 max-h-72 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/50 p-2 font-mono text-[11px] leading-relaxed">
-          {detail ?? "加载中…"}
-        </pre>
+        <div className="relative ml-7 mb-1">
+          <CopyButton
+            text={detail ?? ""}
+            className="absolute top-1 right-2 bg-muted/50 p-1"
+          />
+          <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/50 p-2 pr-8 font-mono text-[11px] leading-relaxed">
+            {detail ?? "加载中…"}
+          </pre>
+        </div>
       )}
     </div>
   );
@@ -553,6 +566,34 @@ function MessageBlock({
 // it (intent=true) — same bubble, but a target icon instead of the human avatar.
 // summary is a truncated first line, so the full message is pulled from the detail
 // and shown in full (bubble is whitespace-pre-wrap, so long/multi-line text wraps).
+// CopyButton 把一段文本写进剪贴板：点击后短暂显示对勾反馈。
+// clipboard API 仅在 secure context 可用（localhost / https），聊天页满足。
+function CopyButton({ text, className }: { text: string; className?: string }) {
+  const [copied, setCopied] = React.useState(false);
+  return (
+    <button
+      type="button"
+      title="复制到剪贴板"
+      aria-label="复制到剪贴板"
+      className={
+        "inline-flex shrink-0 items-center gap-1 text-[10px] text-muted-foreground transition-colors hover:text-foreground " +
+        (className ?? "")
+      }
+      onClick={async () => {
+        try {
+          await navigator.clipboard.writeText(text);
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1500);
+        } catch {
+          toast.error("复制失败：剪贴板不可用");
+        }
+      }}
+    >
+      {copied ? <CheckIcon className="size-3 text-primary" /> : <CopyIcon className="size-3" />}
+    </button>
+  );
+}
+
 // fmtBytes renders a human file size for attachment chips.
 function fmtBytes(n: number): string {
   if (n >= 1 << 20) return `${(n / (1 << 20)).toFixed(1)} MB`;
@@ -624,7 +665,10 @@ function UserRow({ step, intent, getDetail }: { step: Activity; intent?: boolean
             {text}
           </div>
         )}
-        <ActivityTime ts={step.ts} />
+        <div className="flex items-center gap-2">
+          <ActivityTime ts={step.ts} />
+          {text && <CopyButton text={text} />}
+        </div>
       </div>
       <div className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full bg-primary/10">
         <Icon className="size-3.5 text-primary" />
@@ -667,7 +711,10 @@ function AnswerBlock({ step, getDetail }: { step: Activity; getDetail: (seq: num
           <Markdown text={full ?? step.summary} />
         )}
       </div>
-      <ActivityTime ts={step.ts} />
+      <div className="flex items-center gap-2">
+        <ActivityTime ts={step.ts} />
+        <CopyButton text={full ?? step.summary} />
+      </div>
     </div>
   );
 }
