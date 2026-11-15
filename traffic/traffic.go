@@ -547,13 +547,16 @@ func (t *Traffic) record(f *mproxy.Flow) {
 	// 这里先把需要的字段读出来，避免持锁时再碰 f。
 	hostKey := f.Request.URL.Host
 	banStatus := f.Response.StatusCode
-	banBody := f.Response.Body
+	// 存储/展示/封禁检测用的正文副本：按 Content-Encoding 解压（gzip/br/deflate/
+	// zstd）。不修改 Flow——发给客户端的仍是原始字节，这里只解压落盘的副本。
+	respBody := decodeContentBody(f.Response.Header.Get("Content-Encoding"), f.Response.Body)
+	banBody := respBody
 	reqHead := fmt.Sprintf("%s %s %s\n%s", method, f.Request.URL.RequestURI(), f.Request.Proto, requestHeaderLines(f.Request))
 	respHead := fmt.Sprintf("HTTP %d\n%s", f.Response.StatusCode, headerLines(f.Response.Header))
 	// Bodies are spilled before the transaction opens: blob writes are filesystem
 	// work and must not sit inside the SQLite write lock.
 	reqB := t.spill(f.Request.Body, f.Request.Header.Get("Content-Type"))
-	respB := t.spill(f.Response.Body, ct)
+	respB := t.spill(respBody, ct)
 
 	tx, err := t.db.Begin()
 	if err != nil {
@@ -567,7 +570,7 @@ func (t *Traffic) record(f *mproxy.Flow) {
 	res, err := tx.Exec(`INSERT OR REPLACE INTO exchanges(id,ts,host,method,url_template,url,status,content_type,req_len,resp_len,path)
 VALUES(?,?,?,?,?,?,?,?,?,?,'')`,
 		id, now.Unix(), host, method, tmpl, url, f.Response.StatusCode, ct,
-		len(f.Request.Body), len(f.Response.Body))
+		len(f.Request.Body), len(respBody))
 	if err != nil {
 		log.Printf("[traffic] 记录 %s 失败（写索引）：%v", url, err)
 		return
