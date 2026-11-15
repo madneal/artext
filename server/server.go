@@ -70,7 +70,8 @@ type Server struct {
 	chatBusy map[string]bool
 	// chatPending 是「Codex 模式」的排队注入队列：主 Agent 运行中用户再发的消息
 	// 不再 409，而是立即 emit 用户气泡 + 入队；当前回合结束后由 turn 循环 drain，
-	// 多条合并为一个新回合的输入。键=taskID，chatMu 保护。见 chat()/chatLoop()。
+	// 多条合并为一个新回合的输入。键=taskID 或 "conv-<id>"（两套对话系统共用），
+	// chatMu 保护。经 queueChatPending/drainChatPending/pendingCount 访问（懒初始化）。
 	chatPending map[string][]string
 	// chatCancel holds the cancel func for each in-flight conversation run (keyed by
 	// convBusyKey), so a manual stop can abort JUST that session's agent run. Set/
@@ -3696,11 +3697,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 停止后残留的排队消息并入本次输入（见回合循环的 drain 语义：用户消息永不丢失）。
-	s.chatMu.Lock()
-	leftover := s.chatPending[t.ID]
-	s.chatPending[t.ID] = nil
-	s.chatMu.Unlock()
-	if len(leftover) > 0 {
+	if leftover := s.drainChatPending(t.ID); len(leftover) > 0 {
 		agentMessage = strings.Join(append(leftover, agentMessage), "\n\n")
 	}
 	// Admission is serialized with deletion's chat cancellation. Mark every chat
@@ -3716,6 +3713,10 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	// 气泡（activity 落库 + SSE），agentMessage 入队，当前回合结束后由 turn 循环
 	// 自动消费。不注册新 cancel：沿用正在运行的回合。
 	if s.chatBusy[t.ID] {
+		// 已持 chatMu：直接访问 map（helper 会重入死锁）。
+		if s.chatPending == nil {
+			s.chatPending = map[string][]string{}
+		}
 		s.chatPending[t.ID] = append(s.chatPending[t.ID], agentMessage)
 		mainSegQ, _ := t.Store.CurrentMainSeg()
 		if req.Seg != nil && *req.Seg >= 0 {
@@ -3725,8 +3726,9 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		humanTurnQ := userActivityWithAttachments("mainagent", req.Message, req.Attachments)
 		humanTurnQ.MainSeg = segQ
 		s.engine.emitActivity(t, humanTurnQ)
+		pending := len(s.chatPending[t.ID])
 		s.chatMu.Unlock()
-		writeJSON(w, 202, map[string]any{"status": "queued", "pending": len(s.chatPending[t.ID])})
+		writeJSON(w, 202, map[string]any{"status": "queued", "pending": pending})
 		return
 	}
 	ctx, cancel := context.WithCancelCause(s.ctx)
@@ -3795,10 +3797,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				if ctx.Err() != nil {
 					return // 用户停止：保留队列，下次发送并入
 				}
-				s.chatMu.Lock()
-				pending := s.chatPending[t.ID]
-				s.chatPending[t.ID] = nil
-				s.chatMu.Unlock()
+				pending := s.drainChatPending(t.ID)
 				if len(pending) == 0 {
 					return
 				}
@@ -3835,6 +3834,35 @@ func (s *Server) finishTaskChat(taskID string, cancel context.CancelCauseFunc) {
 // taskChatStatus reports the authoritative state of the task's main-agent turn.
 // Activity timestamps are not a reliable proxy because a tool or LLM call may run
 // for minutes without emitting an intermediate frame.
+// queueChatPending 追加一条排队消息（懒初始化 map，直接构造的 Server 也安全）。
+func (s *Server) queueChatPending(key, msg string) {
+	s.chatMu.Lock()
+	defer s.chatMu.Unlock()
+	if s.chatPending == nil {
+		s.chatPending = map[string][]string{}
+	}
+	s.chatPending[key] = append(s.chatPending[key], msg)
+}
+
+// drainChatPending 取走 key 的全部排队消息（顺序保留）。
+func (s *Server) drainChatPending(key string) []string {
+	s.chatMu.Lock()
+	defer s.chatMu.Unlock()
+	if len(s.chatPending[key]) == 0 {
+		return nil
+	}
+	out := s.chatPending[key]
+	delete(s.chatPending, key)
+	return out
+}
+
+// pendingCount 返回 key 当前排队条数。
+func (s *Server) pendingCount(key string) int {
+	s.chatMu.Lock()
+	defer s.chatMu.Unlock()
+	return len(s.chatPending[key])
+}
+
 func (s *Server) taskChatStatus(w http.ResponseWriter, r *http.Request) {
 	t := s.m.ResolveTask(r.PathValue("id"))
 	if t == nil {
@@ -3843,8 +3871,8 @@ func (s *Server) taskChatStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	s.chatMu.Lock()
 	running := s.chatBusy[t.ID]
-	pending := len(s.chatPending[t.ID])
 	s.chatMu.Unlock()
+	pending := s.pendingCount(t.ID)
 	writeJSON(w, http.StatusOK, map[string]any{"running": running, "pending": pending})
 }
 

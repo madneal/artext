@@ -421,7 +421,10 @@ func (s *Server) pgSendConversationMessage(w http.ResponseWriter, r *http.Reques
 	if s.chatBusy[busyKey] {
 		// Codex 模式排队注入：运行中再发的消息不再 409——立即落用户气泡
 		// （conversation_activities + SSE），agent 输入入队，当前回合结束后由
-		// turn 循环自动消费。
+		// turn 循环自动消费。已持 chatMu：直接访问 map（helper 会重入死锁）。
+		if s.chatPending == nil {
+			s.chatPending = map[string][]string{}
+		}
 		s.chatPending[busyKey] = append(s.chatPending[busyKey],
 			composeAgentMessage(agentMessage, req.Attachments, filepath.Join(s.m.dir, "sessions", busyKey)))
 		ua := userActivityWithAttachments(c.AgentKey, msg, req.Attachments)
@@ -438,11 +441,10 @@ func (s *Server) pgSendConversationMessage(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	s.chatBusy[busyKey] = true
-	// 停止后残留的排队消息并入本次输入（用户消息永不丢失）。
-	leftover := s.chatPending[busyKey]
-	s.chatPending[busyKey] = nil
 	s.chatMu.Unlock()
-	if len(leftover) > 0 {
+	// 停止后残留的排队消息并入本次输入（用户消息永不丢失）。drain 必须在锁外
+	// —— helper 内部加 chatMu，锁内调用会重入死锁。
+	if leftover := s.drainChatPending(busyKey); len(leftover) > 0 {
 		agentMessage = strings.Join(append(leftover, agentMessage), "\n\n")
 	}
 
@@ -596,10 +598,7 @@ func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelC
 		if ctx.Err() != nil {
 			return // 用户停止：保留队列，下次发送并入
 		}
-		s.chatMu.Lock()
-		pending := s.chatPending[busyKey]
-		s.chatPending[busyKey] = nil
-		s.chatMu.Unlock()
+		pending := s.drainChatPending(busyKey)
 		if len(pending) == 0 {
 			return
 		}
