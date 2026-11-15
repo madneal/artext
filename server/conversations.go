@@ -419,12 +419,32 @@ func (s *Server) pgSendConversationMessage(w http.ResponseWriter, r *http.Reques
 	busyKey := s.convBusyKey(c.ID)
 	s.chatMu.Lock()
 	if s.chatBusy[busyKey] {
+		// Codex 模式排队注入：运行中再发的消息不再 409——立即落用户气泡
+		// （conversation_activities + SSE），agent 输入入队，当前回合结束后由
+		// turn 循环自动消费。
+		s.chatPending[busyKey] = append(s.chatPending[busyKey],
+			composeAgentMessage(agentMessage, req.Attachments, filepath.Join(s.m.dir, "sessions", busyKey)))
+		ua := userActivityWithAttachments(c.AgentKey, msg, req.Attachments)
+		ua.Summary = firstLine(msg, 200)
+		if ua.Detail == "" {
+			ua.Detail = msg
+		}
+		if _, err := pg.AppendConvActivity(c.ID, ua); err != nil {
+			log.Printf("[conv %d] append queued user msg failed: %v", c.ID, err)
+		}
+		pending := len(s.chatPending[busyKey])
 		s.chatMu.Unlock()
-		writeErr(w, 409, "该会话正在处理上一条消息，请稍候")
+		writeJSON(w, 202, map[string]any{"status": "queued", "pending": pending})
 		return
 	}
 	s.chatBusy[busyKey] = true
+	// 停止后残留的排队消息并入本次输入（用户消息永不丢失）。
+	leftover := s.chatPending[busyKey]
+	s.chatPending[busyKey] = nil
 	s.chatMu.Unlock()
+	if len(leftover) > 0 {
+		agentMessage = strings.Join(append(leftover, agentMessage), "\n\n")
+	}
 
 	// persist + float the human turn; auto-title the thread from the first message.
 	// Worker is the agent key (not "user") so the transcript stays a single lane
@@ -558,18 +578,33 @@ func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelC
 			log.Printf("[conv %d] append activity failed: %v", c.ID, err)
 		}
 	}
-	// On a manual stop ctx is cancelled; Chat already emits a clean "已手动停止"
-	// step, so skip the raw-error entry — only surface genuine failures.
-	if _, err := ca.Chat(ctx, c.AgentKey, sessionID, msg, maxTurns, maxDuration, webSearch, emit); err != nil {
-		finishReason = err.Error()
-		if ctx.Err() == nil {
-			_, _ = pg.AppendConvActivity(c.ID, db.Activity{Worker: c.AgentKey, Kind: "text", IsError: true,
-				Summary: "（出错：" + err.Error() + "）", Detail: err.Error()})
+	// Codex 模式回合循环：跑完一回合后 drain 排队消息，非空则以合并输入开启
+	// 下一回合，直到队列空或用户停止。停止时队列保留（下次发送并入）。
+	for {
+		// On a manual stop ctx is cancelled; Chat already emits a clean "已手动停止"
+		// step, so skip the raw-error entry — only surface genuine failures.
+		if _, err := ca.Chat(ctx, c.AgentKey, sessionID, msg, maxTurns, maxDuration, webSearch, emit); err != nil {
+			finishReason = err.Error()
+			if ctx.Err() == nil {
+				_, _ = pg.AppendConvActivity(c.ID, db.Activity{Worker: c.AgentKey, Kind: "text", IsError: true,
+					Summary: "（出错：" + err.Error() + "）", Detail: err.Error()})
+			}
+		} else {
+			finishStatus, finishReason = "completed", ""
 		}
-	} else {
-		finishStatus, finishReason = "completed", ""
+		_ = pg.TouchConversation(c.ID)
+		if ctx.Err() != nil {
+			return // 用户停止：保留队列，下次发送并入
+		}
+		s.chatMu.Lock()
+		pending := s.chatPending[busyKey]
+		s.chatPending[busyKey] = nil
+		s.chatMu.Unlock()
+		if len(pending) == 0 {
+			return
+		}
+		msg = strings.Join(pending, "\n\n")
 	}
-	_ = pg.TouchConversation(c.ID)
 }
 
 // triggerBehavior is an agent's cached P3 trigger post-processing策略 (see the
