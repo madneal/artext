@@ -106,3 +106,16 @@ func TestDecodeContentBodyJSON(t *testing.T) {
 		t.Fatalf("解压后的 JSON 应可解析: %v", err)
 	}
 }
+
+func TestDecodeContentBodyBombCap(t *testing.T) {
+	// 压缩炸弹：32MiB 的零字节压缩后 <64KB，解压会超过 maxDecodedBody 上限，
+	// 应回落原始压缩字节而不是分配 GB 级内存。
+	bomb := compressWith(t, "gzip", bytes.Repeat([]byte{0}, 64<<20))
+	got := decodeContentBody("gzip", bomb)
+	if len(got) > maxDecodedBody+1 {
+		t.Fatalf("炸弹解压未被限制: %d bytes", len(got))
+	}
+	if len(got) != len(bomb) {
+		t.Fatalf("超限应回落原始压缩字节: got %d want %d", len(got), len(bomb))
+	}
+}

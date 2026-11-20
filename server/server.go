@@ -3696,10 +3696,6 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// 停止后残留的排队消息并入本次输入（见回合循环的 drain 语义：用户消息永不丢失）。
-	if leftover := s.drainChatPending(t.ID); len(leftover) > 0 {
-		agentMessage = strings.Join(append(leftover, agentMessage), "\n\n")
-	}
 	// Admission is serialized with deletion's chat cancellation. Mark every chat
 	// turn busy before its first activity/file write, including rule-mode turns.
 	// If deletion wins the race, the second barrier check rejects this request.
@@ -3713,22 +3709,26 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	// 气泡（activity 落库 + SSE），agentMessage 入队，当前回合结束后由 turn 循环
 	// 自动消费。不注册新 cancel：沿用正在运行的回合。
 	if s.chatBusy[t.ID] {
-		// 已持 chatMu：直接访问 map（helper 会重入死锁）。
+		// 已持 chatMu：只做入队（helper 会重入死锁；DB I/O 与 SSE 解锁后再做）。
 		if s.chatPending == nil {
 			s.chatPending = map[string][]string{}
 		}
-		s.chatPending[t.ID] = append(s.chatPending[t.ID], agentMessage)
+		// 排队消息与直发消息同样拼附件清单（否则运行中带附件发送，agent 拿不到路径）。
+		// 附件-only 消息 agentMessage 可为空，composeAgentMessage 会产出纯清单。
+		queued := composeAgentMessage(agentMessage, req.Attachments, filepath.Join(s.m.dir, "tasks", t.ID))
+		s.chatPending[t.ID] = append(s.chatPending[t.ID], queued)
+		s.chatMu.Unlock()
+		// 气泡 seg 与将应答的回合一致（follow-up turn 固定用当前 mainSeg），
+		// 避免气泡落在 A 段、回答却进 B 段。
 		mainSegQ, _ := t.Store.CurrentMainSeg()
-		if req.Seg != nil && *req.Seg >= 0 {
+		if mainSegQ == 0 && req.Seg != nil && *req.Seg >= 0 {
 			mainSegQ = *req.Seg
 		}
 		segQ := &mainSegQ
 		humanTurnQ := userActivityWithAttachments("mainagent", req.Message, req.Attachments)
 		humanTurnQ.MainSeg = segQ
 		s.engine.emitActivity(t, humanTurnQ)
-		pending := len(s.chatPending[t.ID])
-		s.chatMu.Unlock()
-		writeJSON(w, 202, map[string]any{"status": "queued", "pending": pending})
+		writeJSON(w, 202, map[string]any{"status": "queued", "pending": len(s.chatPending[t.ID])})
 		return
 	}
 	ctx, cancel := context.WithCancelCause(s.ctx)
@@ -3736,6 +3736,11 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	s.chatBusy[t.ID] = true
 	s.chatCancel[t.ID] = cancel
 	s.chatMu.Unlock()
+	// 停止后残留的排队消息并入本次输入（用户消息永不丢失）。放在删除屏障之后：
+	// 删除竞争失败时残留消息随 409 一起被丢弃（气泡已 emit，删除即放弃会话）。
+	if leftover := s.drainChatPending(t.ID); len(leftover) > 0 {
+		agentMessage = strings.Join(append(leftover, agentMessage), "\n\n")
+	}
 
 	// The turn belongs to whichever main-agent segment the user is chatting in (any
 	// segment is interactive, like the top-level chat conversations). Stamp every
@@ -3768,9 +3773,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		// steps + final answer stream back live via SSE (worker="mainagent"), so the
 		// handler returns immediately and the browser never needs to hold the request.
 		go func() {
-			defer func() {
-				s.finishTaskChat(t.ID, cancel)
-			}()
+			defer cancel(agent.AbortChatTurnFinished)
 			// emit every step (thinking/tool_use/tool_result/text/result) so the main
 			// agent session shows its work live, like worker/planner. The final answer
 			// is the captured "result" step — no separate reply emit (would duplicate).
@@ -3795,7 +3798,13 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 					s.engine.emitActivity(t, db.Activity{Worker: "mainagent", Kind: "text", IsError: true, Summary: "（主 Agent 出错：" + err.Error() + "）", MainSeg: segPtr})
 				}
 				if ctx.Err() != nil {
-					return // 用户停止：保留队列，下次发送并入
+					// 用户停止：保留队列（下次发送并入），但 busy 必须清——
+					// 否则停止后的消息永远入队无人消费。
+					s.chatMu.Lock()
+					delete(s.chatBusy, t.ID)
+					delete(s.chatCancel, t.ID)
+					s.chatMu.Unlock()
+					return
 				}
 				pending := s.drainChatPending(t.ID)
 				if len(pending) == 0 {
@@ -3809,7 +3818,12 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	}
 	reply := s.fallbackChat(t, req.Message)
 	s.engine.emitActivity(t, db.Activity{Worker: "mainagent", Kind: "text", Summary: reply, MainSeg: segPtr})
-	s.finishTaskChat(t.ID, cancel)
+	cancel(agent.AbortChatTurnFinished)
+	s.chatMu.Lock()
+	delete(s.chatBusy, t.ID)
+	delete(s.chatCancel, t.ID)
+	// rule 模式没有回合循环——停止后残留队列照常并入下次发送，这里不清空。
+	s.chatMu.Unlock()
 	writeJSON(w, 200, map[string]any{"reply": reply, "mode": "rule"})
 }
 
@@ -3834,16 +3848,6 @@ func (s *Server) finishTaskChat(taskID string, cancel context.CancelCauseFunc) {
 // taskChatStatus reports the authoritative state of the task's main-agent turn.
 // Activity timestamps are not a reliable proxy because a tool or LLM call may run
 // for minutes without emitting an intermediate frame.
-// queueChatPending 追加一条排队消息（懒初始化 map，直接构造的 Server 也安全）。
-func (s *Server) queueChatPending(key, msg string) {
-	s.chatMu.Lock()
-	defer s.chatMu.Unlock()
-	if s.chatPending == nil {
-		s.chatPending = map[string][]string{}
-	}
-	s.chatPending[key] = append(s.chatPending[key], msg)
-}
-
 // drainChatPending 取走 key 的全部排队消息（顺序保留）。
 func (s *Server) drainChatPending(key string) []string {
 	s.chatMu.Lock()

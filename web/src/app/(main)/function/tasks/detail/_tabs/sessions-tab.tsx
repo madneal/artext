@@ -1514,7 +1514,9 @@ export function SessionsTab({ taskId }: { taskId: string }) {
       .chat(text, taskId, atts.length > 0 ? atts : undefined, active.seg ?? 0)
       .then(({ mode, status }) => {
         chatStatusRequestRef.current++;
-        setMainChatRunning(mode === "llm");
+        // queued 响应没有 mode 字段——保持 running 状态不被覆盖（否则停止按钮
+        // 消失、提示条隐藏，闪到下一次 2s 轮询才恢复）。
+        if (mode !== undefined) setMainChatRunning(mode === "llm");
         if (willQueue || status === "queued") {
           toast.success("已插入队列，主 Agent 当前执行结束后自动处理");
         }
