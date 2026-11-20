@@ -216,6 +216,8 @@ func (s *Server) pgDeleteConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.cancelConversation(c.ID)
+	// 删除时丢弃排队消息：气泡已 emit 过，但 agent 不会再消费，留着只会占内存。
+	s.drainChatPending(s.convBusyKey(c.ID))
 	s.cancelSideWhere(func(p sidequestion.Parent) bool { return p.ConversationID == c.ID })
 	if err := pg.DeleteConversation(c.ID); err != nil {
 		writeErr(w, 500, err.Error())
@@ -419,12 +421,34 @@ func (s *Server) pgSendConversationMessage(w http.ResponseWriter, r *http.Reques
 	busyKey := s.convBusyKey(c.ID)
 	s.chatMu.Lock()
 	if s.chatBusy[busyKey] {
+		// Codex 模式排队注入：运行中再发的消息不再 409——立即落用户气泡
+		// （conversation_activities + SSE），agent 输入入队，当前回合结束后由
+		// turn 循环自动消费。已持 chatMu：直接访问 map（helper 会重入死锁）。
+		if s.chatPending == nil {
+			s.chatPending = map[string][]string{}
+		}
+		s.chatPending[busyKey] = append(s.chatPending[busyKey],
+			composeAgentMessage(agentMessage, req.Attachments, filepath.Join(s.m.dir, "sessions", busyKey)))
+		ua := userActivityWithAttachments(c.AgentKey, msg, req.Attachments)
+		ua.Summary = firstLine(msg, 200)
+		if ua.Detail == "" {
+			ua.Detail = msg
+		}
+		if _, err := pg.AppendConvActivity(c.ID, ua); err != nil {
+			log.Printf("[conv %d] append queued user msg failed: %v", c.ID, err)
+		}
+		pending := len(s.chatPending[busyKey])
 		s.chatMu.Unlock()
-		writeErr(w, 409, "该会话正在处理上一条消息，请稍候")
+		writeJSON(w, 202, map[string]any{"status": "queued", "pending": pending})
 		return
 	}
 	s.chatBusy[busyKey] = true
 	s.chatMu.Unlock()
+	// 停止后残留的排队消息并入本次输入（用户消息永不丢失）。drain 必须在锁外
+	// —— helper 内部加 chatMu，锁内调用会重入死锁。
+	if leftover := s.drainChatPending(busyKey); len(leftover) > 0 {
+		agentMessage = strings.Join(append(leftover, agentMessage), "\n\n")
+	}
 
 	// persist + float the human turn; auto-title the thread from the first message.
 	// Worker is the agent key (not "user") so the transcript stays a single lane
@@ -494,11 +518,16 @@ func (s *Server) conversationRunContext(id int64, busyKey string) (context.Conte
 }
 
 func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelCauseFunc, c *db.Conversation, msg, busyKey string) {
+	// busy 的清理由回合循环的「drain 空 + 清 busy」原子段完成（丢失唤醒防护）；
+	// 其余提前 return 的路径（复测 sealed/agent 缺失等）由本 defer 兜底。
+	var busyCleared bool
 	defer func() {
 		cancel(agent.AbortChatTurnFinished)
 		s.chatMu.Lock()
-		delete(s.chatBusy, busyKey)
-		delete(s.chatCancel, busyKey)
+		if !busyCleared {
+			delete(s.chatBusy, busyKey)
+			delete(s.chatCancel, busyKey)
+		}
 		s.chatMu.Unlock()
 	}()
 	// Only the first turn executes a historical retest. Follow-up conversation
@@ -558,18 +587,37 @@ func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelC
 			log.Printf("[conv %d] append activity failed: %v", c.ID, err)
 		}
 	}
-	// On a manual stop ctx is cancelled; Chat already emits a clean "已手动停止"
-	// step, so skip the raw-error entry — only surface genuine failures.
-	if _, err := ca.Chat(ctx, c.AgentKey, sessionID, msg, maxTurns, maxDuration, webSearch, emit); err != nil {
-		finishReason = err.Error()
-		if ctx.Err() == nil {
-			_, _ = pg.AppendConvActivity(c.ID, db.Activity{Worker: c.AgentKey, Kind: "text", IsError: true,
-				Summary: "（出错：" + err.Error() + "）", Detail: err.Error()})
+	// Codex 模式回合循环：跑完一回合后 drain 排队消息，非空则以合并输入开启
+	// 下一回合，直到队列空或用户停止。停止时队列保留（下次发送并入）。
+	for {
+		// On a manual stop ctx is cancelled; Chat already emits a clean "已手动停止"
+		// step, so skip the raw-error entry — only surface genuine failures.
+		if _, err := ca.Chat(ctx, c.AgentKey, sessionID, msg, maxTurns, maxDuration, webSearch, emit); err != nil {
+			finishReason = err.Error()
+			if ctx.Err() == nil {
+				_, _ = pg.AppendConvActivity(c.ID, db.Activity{Worker: c.AgentKey, Kind: "text", IsError: true,
+					Summary: "（出错：" + err.Error() + "）", Detail: err.Error()})
+			}
+		} else {
+			finishStatus, finishReason = "completed", ""
 		}
-	} else {
-		finishStatus, finishReason = "completed", ""
+		_ = pg.TouchConversation(c.ID)
+		_ = pg.TouchConversation(c.ID)
+		// 「drain 空队列」与「清 busy 标志」必须在同一 chatMu 临界区（丢失唤醒防护，
+		// 见任务侧 chat()）；停止时保留队列但清 busy，下次发送并入。
+		s.chatMu.Lock()
+		pending := s.chatPending[busyKey]
+		if len(pending) == 0 || ctx.Err() != nil {
+			busyCleared = true
+			delete(s.chatBusy, busyKey)
+			delete(s.chatCancel, busyKey)
+			s.chatMu.Unlock()
+			return
+		}
+		s.chatPending[busyKey] = nil
+		s.chatMu.Unlock()
+		msg = strings.Join(pending, "\n\n")
 	}
-	_ = pg.TouchConversation(c.ID)
 }
 
 // triggerBehavior is an agent's cached P3 trigger post-processing策略 (see the
